@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: yuumi-py
+Version: 0.1.0
+Summary: Python SDK for Yuumi IPC protocol v2
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: msgpack>=1.0.7
+
+# yuumi-py
+
+Python 3.11+ SDK for Yuumi wire protocol v2.
