@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
 
 MAGIC = 0x59554D49
@@ -39,3 +42,12 @@ class YuumiError(Exception):
         super().__init__(f"[YUUMI_ERR][{int(code)}] {message}")
         self.code = code
         self.message = message
+
+
+@dataclass
+class ReconnectPolicy:
+    """Exponential-backoff reconnect policy, equivalent to Go ReconnectPolicy."""
+    max_attempts: int = 0
+    initial_delay: float = 0.1   # seconds
+    max_delay: float = 2.0       # seconds
+    jitter: float = 0.10         # ±10 % jitter fraction
