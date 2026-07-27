@@ -1,10 +1,41 @@
-from .client import Client, connect, MessageHandler, HeartbeatHandler, ErrorHandler
-from .diagnostic import Diagnostic
-from .types import Channel, Encoding, ReconnectPolicy
+from .engine import Engine
+from .transport import resolve_transport_address
+from .types import (
+    CAP_CORRELATION,
+    Channel,
+    DisconnectEvent,
+    DisconnectReason,
+    Encoding,
+    EngineConfig,
+    EngineError,
+    ErrorCategory,
+    ErrorInfo,
+    ErrorPhase,
+    FragmentationSettings,
+    HeartbeatSettings,
+    MessageEvent,
+    SessionHandle,
+    SessionView,
+    StatusCode,
+)
 
 __all__ = [
-    "Client", "connect",
-    "Channel", "Encoding", "ReconnectPolicy",
-    "MessageHandler", "HeartbeatHandler", "ErrorHandler",
-    "Diagnostic",
+    "CAP_CORRELATION",
+    "Channel",
+    "DisconnectEvent",
+    "DisconnectReason",
+    "Encoding",
+    "Engine",
+    "EngineConfig",
+    "EngineError",
+    "ErrorCategory",
+    "ErrorInfo",
+    "ErrorPhase",
+    "FragmentationSettings",
+    "HeartbeatSettings",
+    "MessageEvent",
+    "SessionHandle",
+    "SessionView",
+    "StatusCode",
+    "resolve_transport_address",
 ]

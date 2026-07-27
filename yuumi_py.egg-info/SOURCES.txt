@@ -2,7 +2,8 @@ README.md
 pyproject.toml
 tests/test_yuumi.py
 yuumi/__init__.py
-yuumi/client.py
+yuumi/_winpipe.py
+yuumi/engine.py
 yuumi/protocol.py
 yuumi/transport.py
 yuumi/types.py

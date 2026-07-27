@@ -1,8 +1,18 @@
 # yuumi-py
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
+`yuumi-py` is the Python Engine SDK for the Yuumi local IPC protocol. It opens a
+platform-native local endpoint and accepts sessions from the Go shell. It does
+not expose a client or outbound dialer API.
 
-> Python SDK for the [Yuumi IPC protocol](https://github.com/YuumiConnectionLibrary/yuumi-spec) — connect your Python backend to a Go frontend over a local Unix socket.
+## Requirements
+
+- Python 3.11 or newer
+- Linux, macOS, or Windows
+- `msgpack` for MessagePack application payloads
+
+Linux and macOS use Unix domain stream sockets. Windows uses byte-stream Named
+Pipes through the package's pure-Python `ctypes` shim. Installation does not
+require `pywin32`, a compiler, or any native build step.
 
 ## Install
 
@@ -10,73 +20,84 @@
 pip install yuumi-py
 ```
 
-Only one external dependency: [`msgpack`](https://pypi.org/project/msgpack/).
-
-## Quick start
+## Engine example
 
 ```python
-from yuumi import connect, Channel
+from yuumi import Channel, Engine, EngineConfig
 
-with connect("my-service") as client:
-    client.on_message(lambda data, ch: print(f"channel={ch.name} data={data}"))
-    client.on_heartbeat(lambda ts: print(f"heartbeat ts={ts}"))
-    client.on_error(lambda err: print(f"error: {err}"))
-    client.listen()
-
-    client.send({"status": "ready"}, Channel.COMMAND)
-
-    data, channel = client.receive()
-    print(data, channel)
-```
-
-## Reconnect policy
-
-```python
-from yuumi import connect, ReconnectPolicy
-
-client = connect("my-service", policy=ReconnectPolicy(
-    max_attempts=5,
-    initial_delay=0.1,   # seconds
-    max_delay=2.0,
+engine = Engine(EngineConfig(
+    endpoint_name="example",
+    token="0123456789abcdef0123456789abcdef",
 ))
+
+def connected(session):
+    print(f"connected: {session.handle.session_id}")
+
+def message(event):
+    if event.correlation_id is None:
+        engine.send(event.session, Channel.DATA, {"ok": True})
+    else:
+        engine.send_correlated(
+            event.session,
+            Channel.DATA,
+            event.correlation_id,
+            {"ok": True},
+        )
+
+engine.on_session_connected(connected)
+engine.on_message(message)
+engine.on_error(lambda event: print(f"{event.phase.value}: {event.cause}"))
+engine.on_session_disconnected(
+    lambda event: print(f"disconnected: {event.reason.value}")
+)
+
+engine.open()
+try:
+    run_application_loop()
+finally:
+    engine.close()
 ```
 
-## API reference
+Application code may send only `Channel.LOG` and `Channel.DATA`. Control
+traffic, session assignment, heartbeat, ping/pong, and protocol errors belong
+to the SDK. `Channel.COMMAND` is inbound from the Go shell.
 
-| Symbol | Description |
-|---|---|
-| `connect(pipe_name, policy?, timeout?)` | Dial, handshake, return `Client` |
-| `Client.connect(pipe_name, timeout?)` | Class-method equivalent |
-| `Client.connect_with_policy(pipe_name, policy, timeout?)` | Dial with exponential-backoff retry |
-| `client.send(data, channel)` | Encode and send a data frame |
-| `client.receive()` | Read one frame synchronously → `(data, channel)` |
-| `client.listen()` | Start daemon read thread |
-| `client.on_message(fn)` | `fn(data: dict, channel: Channel)` |
-| `client.on_heartbeat(fn)` | `fn(ts: int)` — called only for heartbeat frames on ChannelControl |
-| `client.on_error(fn)` | `fn(err: YuumiError)` — called on transport / protocol errors |
-| `client.close()` | Shut down connection |
-| `Client` as context manager | `with connect(...) as c:` — calls `close()` automatically |
-| `ReconnectPolicy` | Dataclass: `max_attempts`, `initial_delay`, `max_delay`, `jitter` |
-| `Diagnostic` | Structured stdout logging: `.log()`, `.error()`, `.success()` |
+## Configuration
 
-## Channels
+`EngineConfig` requires an endpoint name and a 32-character lowercase
+hexadecimal token. Its defaults are:
 
-| Constant | Value | Purpose |
-|---|---|---|
-| `Channel.CONTROL` | `0` | Heartbeat, lifecycle |
-| `Channel.COMMAND` | `1` | Commands |
-| `Channel.LOG` | `2` | Log output |
-| `Channel.DATA` | `3` | Application payload |
+- one simultaneous session;
+- MessagePack preferred over JSON;
+- `CAP_CORRELATION` supported;
+- heartbeat every 30 seconds with a three-interval miss limit;
+- fragment expiry after 15 seconds and at most 16 active sequences per session.
 
-## Requirements
+Set `HeartbeatSettings(disabled=True)` when the application intentionally does
+not want SDK heartbeat emission. `expected_pid` is an optional additional
+filter; it is not authentication and zero is a real PID value.
 
-- Python 3.11+
-- Linux, macOS, Windows 10 1803+
+## Concurrency and events
 
-## Wire protocol
+Every accepted connection has an explicit daemon session worker. Callbacks run
+synchronously on that session worker; timer-generated errors run on the
+explicit daemon maintenance worker. Events for one session are serialized in
+connected, message/error, disconnected order. Different sessions may execute
+callbacks concurrently.
 
-See [yuumi-spec](https://github.com/YuumiConnectionLibrary/yuumi-spec) for the canonical wire format and conformance test vectors.
+Sequential sends to one session preserve submission order. Concurrent sends
+follow acquisition order of that session's write lock. Do not call
+`engine.close()` synchronously from a callback because close waits for callback
+completion; schedule it on the application lifecycle thread instead.
 
-## Issues
+## Protocol and conformance
 
-Questions or problems? [Open an issue](https://github.com/YuumiConnectionLibrary/yuumi-py/issues).
+The SDK implements wire protocol version `1`, capability negotiation,
+generation-aware session handles, bounded framing and fragmentation, strict
+JSON/MessagePack decoding, correlation, and platform endpoint security. The
+numbered Engine conformance tests consume the canonical fixtures from
+[`yuumi-spec/test-vectors`](../yuumi-spec/test-vectors).
+
+The authoritative contracts are
+[`ENGINE_API.md`](../yuumi-spec/ENGINE_API.md) and
+[`PROTOCOL.md`](../yuumi-spec/PROTOCOL.md).

@@ -1,11 +1,111 @@
 Metadata-Version: 2.4
 Name: yuumi-py
 Version: 0.1.0
-Summary: Python SDK for Yuumi IPC protocol v2
+Summary: Python Engine SDK for Yuumi IPC protocol version 1
 Requires-Python: >=3.11
 Description-Content-Type: text/markdown
 Requires-Dist: msgpack>=1.0.7
 
 # yuumi-py
 
-Python 3.11+ SDK for Yuumi wire protocol v2.
+`yuumi-py` is the Python Engine SDK for the Yuumi local IPC protocol. It opens a
+platform-native local endpoint and accepts sessions from the Go shell. It does
+not expose a client or outbound dialer API.
+
+## Requirements
+
+- Python 3.11 or newer
+- Linux, macOS, or Windows
+- `msgpack` for MessagePack application payloads
+
+Linux and macOS use Unix domain stream sockets. Windows uses byte-stream Named
+Pipes through the package's pure-Python `ctypes` shim. Installation does not
+require `pywin32`, a compiler, or any native build step.
+
+## Install
+
+```bash
+pip install yuumi-py
+```
+
+## Engine example
+
+```python
+from yuumi import Channel, Engine, EngineConfig
+
+engine = Engine(EngineConfig(
+    endpoint_name="example",
+    token="0123456789abcdef0123456789abcdef",
+))
+
+def connected(session):
+    print(f"connected: {session.handle.session_id}")
+
+def message(event):
+    if event.correlation_id is None:
+        engine.send(event.session, Channel.DATA, {"ok": True})
+    else:
+        engine.send_correlated(
+            event.session,
+            Channel.DATA,
+            event.correlation_id,
+            {"ok": True},
+        )
+
+engine.on_session_connected(connected)
+engine.on_message(message)
+engine.on_error(lambda event: print(f"{event.phase.value}: {event.cause}"))
+engine.on_session_disconnected(
+    lambda event: print(f"disconnected: {event.reason.value}")
+)
+
+engine.open()
+try:
+    run_application_loop()
+finally:
+    engine.close()
+```
+
+Application code may send only `Channel.LOG` and `Channel.DATA`. Control
+traffic, session assignment, heartbeat, ping/pong, and protocol errors belong
+to the SDK. `Channel.COMMAND` is inbound from the Go shell.
+
+## Configuration
+
+`EngineConfig` requires an endpoint name and a 32-character lowercase
+hexadecimal token. Its defaults are:
+
+- one simultaneous session;
+- MessagePack preferred over JSON;
+- `CAP_CORRELATION` supported;
+- heartbeat every 30 seconds with a three-interval miss limit;
+- fragment expiry after 15 seconds and at most 16 active sequences per session.
+
+Set `HeartbeatSettings(disabled=True)` when the application intentionally does
+not want SDK heartbeat emission. `expected_pid` is an optional additional
+filter; it is not authentication and zero is a real PID value.
+
+## Concurrency and events
+
+Every accepted connection has an explicit daemon session worker. Callbacks run
+synchronously on that session worker; timer-generated errors run on the
+explicit daemon maintenance worker. Events for one session are serialized in
+connected, message/error, disconnected order. Different sessions may execute
+callbacks concurrently.
+
+Sequential sends to one session preserve submission order. Concurrent sends
+follow acquisition order of that session's write lock. Do not call
+`engine.close()` synchronously from a callback because close waits for callback
+completion; schedule it on the application lifecycle thread instead.
+
+## Protocol and conformance
+
+The SDK implements wire protocol version `1`, capability negotiation,
+generation-aware session handles, bounded framing and fragmentation, strict
+JSON/MessagePack decoding, correlation, and platform endpoint security. The
+numbered Engine conformance tests consume the canonical fixtures from
+[`yuumi-spec/test-vectors`](../yuumi-spec/test-vectors).
+
+The authoritative contracts are
+[`ENGINE_API.md`](../yuumi-spec/ENGINE_API.md) and
+[`PROTOCOL.md`](../yuumi-spec/PROTOCOL.md).
