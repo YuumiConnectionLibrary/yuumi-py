@@ -1,8 +1,9 @@
 # yuumi-py
 
-`yuumi-py` is the Python Engine SDK for the Yuumi local IPC protocol. It opens a
-platform-native local endpoint and accepts sessions from the Go shell. It does
-not expose a client or outbound dialer API.
+`yuumi-py` is the Python Engine SDK for the Yuumi local IPC protocol. The
+engine performs one explicit dial to the listener owned by the Go shell. It
+never creates, probes, removes, or accepts connections on an endpoint and it
+does not expose a client, listener, Runner, or automatic reconnect API.
 
 ## Requirements
 
@@ -10,9 +11,10 @@ not expose a client or outbound dialer API.
 - Linux, macOS, or Windows
 - `msgpack` for MessagePack application payloads
 
-Linux and macOS use Unix domain stream sockets. Windows uses byte-stream Named
-Pipes through the package's pure-Python `ctypes` shim. Installation does not
-require `pywin32`, a compiler, or any native build step.
+Linux and macOS dial Unix domain stream sockets through Python's standard
+`socket` module. Windows dials byte-stream Named Pipes through the package's
+pure-Python `ctypes` shim. Installation does not require `pywin32`, a
+compiler, an extension module, or another native build step.
 
 ## Install
 
@@ -20,7 +22,7 @@ require `pywin32`, a compiler, or any native build step.
 pip install yuumi-py
 ```
 
-## Engine example
+## Engine dialer example
 
 ```python
 from yuumi import Channel, Engine, EngineConfig
@@ -31,72 +33,81 @@ engine = Engine(EngineConfig(
 ))
 
 def connected(session):
-    print(f"connected: {session.handle.session_id}")
+    print(f"connected: {session.session_id}, epoch={session.epoch}")
 
 def message(event):
-    if event.correlation_id is None:
-        engine.send(event.session, Channel.DATA, {"ok": True})
+    if event.responder is not None:
+        event.responder.respond({"ok": True})
     else:
-        engine.send_correlated(
-            event.session,
-            Channel.DATA,
-            event.correlation_id,
-            {"ok": True},
-        )
+        engine.send(Channel.DATA, {"ok": True})
 
 engine.on_session_connected(connected)
 engine.on_message(message)
-engine.on_error(lambda event: print(f"{event.phase.value}: {event.cause}"))
+engine.on_heartbeat(lambda event: print(f"heartbeat: {event.timestamp}"))
+engine.on_error(lambda event: print(f"{event.kind.value}: {event.cause}"))
 engine.on_session_disconnected(
-    lambda event: print(f"disconnected: {event.reason.value}")
+    lambda event: print(f"disconnected: {event.terminal.reason.value}")
 )
 
-engine.open()
 try:
-    run_application_loop()
+    session = engine.connect()
+    run_application_loop(session)
 finally:
     engine.close()
 ```
 
-Application code may send only `Channel.LOG` and `Channel.DATA`. Control
-traffic, session assignment, heartbeat, ping/pong, and protocol errors belong
-to the SDK. `Channel.COMMAND` is inbound from the Go shell.
+`connect()` makes one attempt and returns only after ACK and session assignment
+have been written. It does not retry. After a disconnect the application may
+call `connect()` again; the new session has a new identifier and a strictly
+greater local epoch.
+
+Application code may send only `Channel.LOG` and `Channel.DATA`. A correlated
+inbound message carries a single-use responder that always replies on
+`Channel.DATA`. Control traffic, heartbeat, ping/pong, protocol errors, and
+session assignment belong to the SDK.
 
 ## Configuration
 
-`EngineConfig` requires an endpoint name and a 32-character lowercase
-hexadecimal token. Its defaults are:
+`EngineConfig` is immutable and requires an endpoint name and a 32-character
+lowercase hexadecimal token. Its defaults are:
 
-- one simultaneous session;
 - MessagePack preferred over JSON;
 - `CAP_CORRELATION` supported;
+- a 10-second complete dial-and-handshake timeout;
+- a bounded application queue with capacity 64;
 - heartbeat every 30 seconds with a three-interval miss limit;
-- fragment expiry after 15 seconds and at most 16 active sequences per session.
+- fragment expiry after 15 seconds and at most 16 active sequences.
 
-Set `HeartbeatSettings(disabled=True)` when the application intentionally does
-not want SDK heartbeat emission. `expected_pid` is an optional additional
-filter; it is not authentication and zero is a real PID value.
+`expected_go_pid` is an optional additional check and is not authentication.
+`HeartbeatSettings(disabled=True)` disables SDK heartbeat emission.
 
-## Concurrency and events
+## Threads, callbacks, and backpressure
 
-Every accepted connection has an explicit daemon session worker. Callbacks run
-synchronously on that session worker; timer-generated errors run on the
-explicit daemon maintenance worker. Events for one session are serialized in
-connected, message/error, disconnected order. Different sessions may execute
-callbacks concurrently.
+Each established epoch owns three explicit, named daemon threads:
 
-Sequential sends to one session preserve submission order. Concurrent sends
-follow acquisition order of that session's write lock. Do not call
-`engine.close()` synchronously from a callback because close waits for callback
-completion; schedule it on the application lifecycle thread instead.
+- `yuumi-engine-reader-<epoch>` parses frames and answers Control traffic;
+- `yuumi-engine-maintenance-<epoch>` handles heartbeat and fragment deadlines;
+- `yuumi-engine-dispatch-<epoch>` invokes callbacks serially in wire order.
+
+Application callbacks never run on the IPC reader. A slow callback therefore
+does not prevent ping/pong, framing, heartbeat, or writes from advancing.
+Queued and currently running application events count against the configured
+capacity. Queue exhaustion closes the session and delivers a typed
+`backpressure` error followed by the disconnected event.
+
+Callbacks are synchronous callables and never overlap within one epoch. A
+callback exception becomes an observable `application` error. Exceptions from
+the error or disconnected observer are forwarded to `threading.excepthook`.
+`close()` cancels I/O, wakes waits, and joins owned workers against a bounded
+deadline; it is idempotent.
 
 ## Protocol and conformance
 
 The SDK implements wire protocol version `1`, capability negotiation,
-generation-aware session handles, bounded framing and fragmentation, strict
-JSON/MessagePack decoding, correlation, and platform endpoint security. The
-numbered Engine conformance tests consume the canonical fixtures from
-[`yuumi-spec/test-vectors`](../yuumi-spec/test-vectors).
+generation-aware responders, bounded framing and fragmentation, strict
+JSON/MessagePack decoding, correlation, and platform-native transport. The
+tests use the frozen vectors and a private Go-role listener in `tests/testkit.py`.
+The listener is not part of the installed package or public API.
 
 The authoritative contracts are
 [`ENGINE_API.md`](../yuumi-spec/ENGINE_API.md) and

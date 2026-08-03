@@ -1,6 +1,7 @@
 README.md
 pyproject.toml
 tests/test_yuumi.py
+tests/testkit.py
 yuumi/__init__.py
 yuumi/_winpipe.py
 yuumi/engine.py

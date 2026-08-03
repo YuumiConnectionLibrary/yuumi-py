@@ -1,5 +1,4 @@
 from .engine import Engine
-from .transport import resolve_transport_address
 from .types import (
     CAP_CORRELATION,
     Channel,
@@ -8,15 +7,18 @@ from .types import (
     Encoding,
     EngineConfig,
     EngineError,
-    ErrorCategory,
+    EngineState,
     ErrorInfo,
+    ErrorKind,
     ErrorPhase,
     FragmentationSettings,
+    HeartbeatEvent,
     HeartbeatSettings,
     MessageEvent,
-    SessionHandle,
+    Responder,
     SessionView,
     StatusCode,
+    TerminalResult,
 )
 
 __all__ = [
@@ -28,14 +30,16 @@ __all__ = [
     "Engine",
     "EngineConfig",
     "EngineError",
-    "ErrorCategory",
+    "EngineState",
     "ErrorInfo",
+    "ErrorKind",
     "ErrorPhase",
     "FragmentationSettings",
+    "HeartbeatEvent",
     "HeartbeatSettings",
     "MessageEvent",
-    "SessionHandle",
+    "Responder",
     "SessionView",
     "StatusCode",
-    "resolve_transport_address",
+    "TerminalResult",
 ]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum, IntFlag
-from typing import Any
+from typing import Any, Protocol
 
 MAGIC = 0x59554D49
 PROTOCOL_VERSION = 1
@@ -43,22 +43,28 @@ class StatusCode(IntEnum):
     ERR_INTERNAL = 599
 
 
-class ErrorCategory(Enum):
+class ErrorKind(Enum):
     CONFIGURATION = "configuration"
-    ENDPOINT = "endpoint"
+    ADDRESS_DERIVATION = "address_derivation"
+    DIAL = "dial"
+    TIMEOUT = "timeout"
     HANDSHAKE = "handshake"
     PROTOCOL = "protocol"
+    ENCODING = "encoding"
+    CAPABILITY = "capability"
+    BACKPRESSURE = "backpressure"
+    SESSION_CLOSED = "session_closed"
+    STALE_EPOCH = "stale_epoch"
+    APPLICATION = "application"
     TRANSPORT = "transport"
-    SERIALIZATION = "serialization"
-    SESSION = "session"
     INTERNAL = "internal"
+    STATE = "state"
 
 
 class ErrorPhase(Enum):
     CONFIGURATION = "configuration"
-    ENDPOINT_PROBE = "endpoint_probe"
-    ENDPOINT_OPEN = "endpoint_open"
-    ACCEPT = "accept"
+    ADDRESS_DERIVATION = "address_derivation"
+    DIAL = "dial"
     HANDSHAKE_READ = "handshake_read"
     HANDSHAKE_VALIDATE = "handshake_validate"
     ACK_WRITE = "ack_write"
@@ -68,84 +74,111 @@ class ErrorPhase(Enum):
     FRAME_WRITE = "frame_write"
     HEARTBEAT = "heartbeat"
     FRAGMENTATION = "fragmentation"
+    APPLICATION_DISPATCH = "application_dispatch"
     APPLICATION_SEND = "application_send"
     CLOSE = "close"
 
 
 class DisconnectReason(Enum):
-    ENGINE_CLOSE = "engine_close"
+    LOCAL_CLOSE = "local_close"
     PEER_CLOSE = "peer_close"
     HEARTBEAT_TIMEOUT = "heartbeat_timeout"
     PROTOCOL_FAILURE = "protocol_failure"
     TRANSPORT_FAILURE = "transport_failure"
+    BACKPRESSURE = "backpressure"
 
 
-@dataclass(frozen=True)
-class SessionHandle:
-    session_id: str
-    epoch: int
+class EngineState(Enum):
+    IDLE = "idle"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    CLOSING = "closing"
 
 
 @dataclass(frozen=True)
 class SessionView:
-    handle: SessionHandle
+    session_id: str
+    epoch: int
     encoding: Encoding
     capabilities: int
 
 
+class Responder(Protocol):
+    def respond(self, payload: Any) -> None: ...
+
+
 @dataclass(frozen=True)
 class MessageEvent:
-    session: SessionHandle
+    session: SessionView
     channel: Channel
     payload: Any
     correlation_id: int | None = None
+    responder: Responder | None = None
+
+
+@dataclass(frozen=True)
+class HeartbeatEvent:
+    session: SessionView
+    timestamp: int
 
 
 @dataclass(frozen=True)
 class ErrorInfo:
-    category: ErrorCategory
-    status: StatusCode
-    phase: ErrorPhase
+    kind: ErrorKind
     cause: str
-    session: SessionHandle | None = None
+    status: StatusCode | None = None
+    phase: ErrorPhase | None = None
+    epoch: int | None = None
+
+
+@dataclass(frozen=True)
+class TerminalResult:
+    reason: DisconnectReason
+    error: ErrorInfo | None = None
 
 
 @dataclass(frozen=True)
 class DisconnectEvent:
-    session: SessionHandle
-    reason: DisconnectReason
+    session: SessionView
+    terminal: TerminalResult
 
 
-@dataclass
+@dataclass(frozen=True)
 class HeartbeatSettings:
     disabled: bool = False
     interval: float = 30.0
     missed_interval_limit: int = 3
 
 
-@dataclass
+@dataclass(frozen=True)
 class FragmentationSettings:
     timeout: float = 15.0
     active_sequence_limit: int = 16
 
 
-@dataclass
+@dataclass(frozen=True)
 class EngineConfig:
     endpoint_name: str
     token: str
-    max_sessions: int = 1
     supported_encodings: tuple[Encoding, ...] = (Encoding.MSGPACK, Encoding.JSON)
     supported_capabilities: int = CAP_CORRELATION
-    expected_pid: int | None = None
+    expected_go_pid: int | None = None
+    connect_timeout: float = 10.0
+    application_queue_capacity: int = 64
     heartbeat: HeartbeatSettings = field(default_factory=HeartbeatSettings)
     fragmentation: FragmentationSettings = field(default_factory=FragmentationSettings)
 
 
 class EngineError(Exception):
     def __init__(self, info: ErrorInfo) -> None:
-        super().__init__(f"[YUUMI_ERR][{int(info.status)}] {info.cause}")
+        status = "" if info.status is None else f"[{int(info.status)}]"
+        super().__init__(f"[YUUMI_ERR][{info.kind.value}]{status} {info.cause}")
         self.info = info
 
     @property
-    def code(self) -> StatusCode:
+    def kind(self) -> ErrorKind:
+        return self.info.kind
+
+    @property
+    def code(self) -> StatusCode | None:
         return self.info.status

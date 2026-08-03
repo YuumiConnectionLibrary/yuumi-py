@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import copy
+import inspect
 import struct
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from .protocol import (
@@ -19,13 +20,13 @@ from .protocol import (
     decode_control,
     decode_payload,
     encode_payload,
-    error,
 )
 from .transport import (
     Stream,
     TransportClosed,
     TransportFailure,
-    create_listener,
+    TransportTimeout,
+    dial_local,
     resolve_transport_address,
     valid_endpoint_name,
     valid_token,
@@ -42,104 +43,154 @@ from .types import (
     Encoding,
     EngineConfig,
     EngineError,
-    ErrorCategory,
+    EngineState,
     ErrorInfo,
+    ErrorKind,
     ErrorPhase,
+    FragmentationSettings,
+    HeartbeatEvent,
+    HeartbeatSettings,
     MessageEvent,
-    SessionHandle,
     SessionView,
     StatusCode,
+    TerminalResult,
 )
+
+_THREAD_JOIN_TIMEOUT = 2.0
 
 ConnectedHandler = Callable[[SessionView], None]
 MessageHandler = Callable[[MessageEvent], None]
+HeartbeatHandler = Callable[[HeartbeatEvent], None]
 ErrorHandler = Callable[[ErrorInfo], None]
 DisconnectedHandler = Callable[[DisconnectEvent], None]
 
 
+def _error(
+    kind: ErrorKind,
+    cause: str,
+    status: StatusCode | None = None,
+    phase: ErrorPhase | None = None,
+    epoch: int | None = None,
+) -> ErrorInfo:
+    return ErrorInfo(kind, cause, status, phase, epoch)
+
+
+def _engine_error(
+    kind: ErrorKind,
+    cause: str,
+    status: StatusCode | None = None,
+    phase: ErrorPhase | None = None,
+    epoch: int | None = None,
+) -> EngineError:
+    return EngineError(_error(kind, cause, status, phase, epoch))
+
+
 @dataclass
 class _Fragment:
-    fragment_id: int
+    identifier: int
     correlation_id: int | None
     data: bytearray
     deadline: float
 
 
-class _PendingCorrelations:
-    def __init__(self) -> None:
-        self._identifiers: set[int] = set()
+@dataclass
+class _DispatchItem:
+    kind: str
+    value: object
+    uses_capacity: bool
+
+
+class _Responder:
+    def __init__(self, engine: Engine, epoch: int, correlation_id: int) -> None:
+        self._engine = engine
+        self._epoch = epoch
+        self._correlation_id = correlation_id
+        self._used = False
         self._lock = threading.Lock()
 
-    def begin(self, identifier: int) -> bool:
+    def respond(self, payload: Any) -> None:
         with self._lock:
-            if identifier in self._identifiers:
-                return False
-            self._identifiers.add(identifier)
-            return True
+            if self._used:
+                raise _engine_error(
+                    ErrorKind.STALE_EPOCH,
+                    "responder is single-use",
+                    StatusCode.ERR_PROTOCOL_VIOLATION,
+                    ErrorPhase.APPLICATION_SEND,
+                    self._epoch,
+                )
+            self._used = True
+        self._engine._respond(self, payload)
 
-    def finish(self, identifier: int) -> bool:
+    def invalidate(self) -> None:
         with self._lock:
-            if identifier not in self._identifiers:
-                return False
-            self._identifiers.remove(identifier)
-            return True
-
-    def clear(self) -> None:
-        with self._lock:
-            self._identifiers.clear()
+            self._used = True
 
 
-@dataclass(eq=False)
 class _Session:
-    stream: Stream
-    encoding: Encoding = Encoding.MSGPACK
-    capabilities: int = 0
-    handle: SessionHandle | None = None
-    established: bool = False
-    close_reason: DisconnectReason = DisconnectReason.PEER_CLOSE
-    close_requested: threading.Event = field(default_factory=threading.Event)
-    terminal_reported: threading.Event = field(default_factory=threading.Event)
-    send_lock: threading.Lock = field(default_factory=threading.Lock)
-    event_lock: threading.Lock = field(default_factory=threading.Lock)
-    fragment_lock: threading.Lock = field(default_factory=threading.Lock)
-    fragments: dict[Channel, _Fragment] = field(default_factory=dict)
-    pending_correlations: _PendingCorrelations = field(default_factory=_PendingCorrelations)
-    last_activity: float = field(default_factory=time.monotonic)
-    last_heartbeat: float = field(default_factory=time.monotonic)
+    def __init__(self, stream: Stream, view: SessionView, config: EngineConfig) -> None:
+        now = time.monotonic()
+        self.stream = stream
+        self.view = view
+        self.config = config
+        self.fragments: dict[Channel, _Fragment] = {}
+        self.responders: set[_Responder] = set()
+        self.last_activity = now
+        self.last_heartbeat = now
+        self.send_lock = threading.Lock()
+        self.data_lock = threading.Lock()
+        self.finalize_lock = threading.Lock()
+        self.close_requested = threading.Event()
+        self.finalized = False
+        self.accepting_events = True
+        self.terminal = TerminalResult(DisconnectReason.PEER_CLOSE)
+        self.events: deque[_DispatchItem] = deque()
+        self.event_condition = threading.Condition()
+        self.capacity_used = 0
+        self.transport_finalized = False
+        self.reader_thread: threading.Thread | None = None
+        self.dispatch_thread: threading.Thread | None = None
+        self.maintenance_thread: threading.Thread | None = None
 
 
 class Engine:
-    """Engine-side Yuumi endpoint.
+    """
+    Single-session Yuumi engine dialer.
 
-    Callbacks execute synchronously on an explicit daemon session worker, or on
-    the maintenance worker for timer events. Events are serialized per session;
-    separate sessions may execute concurrently. Sequential same-session sends
-    preserve submission order, while concurrent sends follow lock acquisition.
+    connect() performs exactly one platform-native dial and handshake attempt.
+    Application callbacks run serially on the named dispatcher thread, never on
+    the reader or maintenance threads. All owned threads are explicit daemon
+    threads and close() wakes and joins them within a bounded deadline.
     """
 
     def __init__(self, config: EngineConfig) -> None:
-        self._config = copy.deepcopy(config)
-        self._lifecycle_lock = threading.Lock()
+        self._source_config = config
+        self._state = EngineState.IDLE
         self._state_lock = threading.Lock()
         self._handlers_lock = threading.Lock()
-        self._workers_lock = threading.Lock()
-        self._callback_local = threading.local()
-        self._closed_event = threading.Event()
-        self._closed_event.set()
-        self._opened = False
-        self._closing = False
-        self._listener = None
-        self._address: str | None = None
-        self._connections: set[_Session] = set()
-        self._sessions: dict[str, _Session] = {}
-        self._workers: set[threading.Thread] = set()
-        self._accept_thread: threading.Thread | None = None
-        self._maintenance_thread: threading.Thread | None = None
+        self._candidate: Stream | None = None
+        self._session: _Session | None = None
         self._next_epoch = 0
+        self._terminal_result: TerminalResult | None = None
         self._connected_handler: ConnectedHandler | None = None
         self._message_handler: MessageHandler | None = None
+        self._heartbeat_handler: HeartbeatHandler | None = None
         self._error_handler: ErrorHandler | None = None
         self._disconnected_handler: DisconnectedHandler | None = None
+
+    @property
+    def state(self) -> EngineState:
+        with self._state_lock:
+            return self._state
+
+    @property
+    def session(self) -> SessionView | None:
+        with self._state_lock:
+            return None if self._session is None else self._session.view
+
+    @property
+    def terminal_result(self) -> TerminalResult | None:
+        with self._state_lock:
+            return self._terminal_result
 
     def on_session_connected(self, handler: ConnectedHandler | None) -> None:
         with self._handlers_lock:
@@ -149,6 +200,10 @@ class Engine:
         with self._handlers_lock:
             self._message_handler = handler
 
+    def on_heartbeat(self, handler: HeartbeatHandler | None) -> None:
+        with self._handlers_lock:
+            self._heartbeat_handler = handler
+
     def on_error(self, handler: ErrorHandler | None) -> None:
         with self._handlers_lock:
             self._error_handler = handler
@@ -157,439 +212,1031 @@ class Engine:
         with self._handlers_lock:
             self._disconnected_handler = handler
 
-    def open(self) -> None:
-        with self._lifecycle_lock:
-            if self._opened or self._closing:
-                raise EngineError(error(ErrorCategory.ENDPOINT, StatusCode.ERR_PIPE_FAILED, ErrorPhase.ENDPOINT_OPEN, "engine is already open or changing state"))
-            self._validate_config()
-            try:
-                address = resolve_transport_address(self._config.endpoint_name, self._config.token)
-            except ValueError as exc:
-                raise EngineError(error(ErrorCategory.CONFIGURATION, StatusCode.ERR_PIPE_FAILED, ErrorPhase.CONFIGURATION, str(exc))) from exc
-            listener = create_listener()
-            try:
-                listener.open(address)
-            except TransportFailure as exc:
-                raise EngineError(error(ErrorCategory.ENDPOINT, StatusCode.ERR_PIPE_FAILED, ErrorPhase.ENDPOINT_OPEN, str(exc))) from exc
-            self._listener = listener
-            self._address = address
-            self._opened = True
-            self._closing = False
-            self._closed_event.clear()
-            self._accept_thread = threading.Thread(target=self._accept_loop, name="yuumi-engine-accept", daemon=True)
-            self._maintenance_thread = threading.Thread(target=self._maintenance_loop, name="yuumi-engine-maintenance", daemon=True)
-            self._accept_thread.start()
-            self._maintenance_thread.start()
+    def connect(self) -> SessionView:
+        with self._state_lock:
+            if self._state != EngineState.IDLE:
+                cause = (
+                    "engine is already connecting"
+                    if self._state == EngineState.CONNECTING
+                    else "engine is already connected or closing"
+                )
+                raise _engine_error(
+                    ErrorKind.STATE,
+                    cause,
+                    StatusCode.ERR_PROTOCOL_VIOLATION,
+                    ErrorPhase.DIAL,
+                )
+        try:
+            config = self._snapshot_and_validate_config()
+        except EngineError as exc:
+            self._emit_pre_session_error(exc.info)
+            raise
+        try:
+            address = resolve_transport_address(config.endpoint_name, config.token)
+        except (OSError, ValueError) as exc:
+            failure = _engine_error(
+                ErrorKind.ADDRESS_DERIVATION,
+                str(exc),
+                StatusCode.ERR_PIPE_FAILED,
+                ErrorPhase.ADDRESS_DERIVATION,
+            )
+            self._emit_pre_session_error(failure.info)
+            raise failure from exc
+        with self._state_lock:
+            if self._state != EngineState.IDLE:
+                raise _engine_error(
+                    ErrorKind.STATE,
+                    "engine state changed before dial",
+                    StatusCode.ERR_PROTOCOL_VIOLATION,
+                    ErrorPhase.DIAL,
+                )
+            self._state = EngineState.CONNECTING
+            self._terminal_result = None
+        deadline = time.monotonic() + config.connect_timeout
+        stream: Stream | None = None
+        phase = ErrorPhase.DIAL
+        try:
+            stream = dial_local(address, config.connect_timeout)
+            with self._state_lock:
+                if self._state != EngineState.CONNECTING:
+                    stream.close()
+                    raise _engine_error(
+                        ErrorKind.SESSION_CLOSED,
+                        "connection attempt was closed locally",
+                        StatusCode.ERR_CONNECTION_LOST,
+                        ErrorPhase.CLOSE,
+                    )
+                self._candidate = stream
+            phase = ErrorPhase.HANDSHAKE_READ
+            stream.set_timeout(self._remaining(deadline))
+            packet = stream.read_exact(16)
+            phase = ErrorPhase.HANDSHAKE_VALIDATE
+            magic, version, pid, encoding_mask = struct.unpack(">IIIB", packet[:13])
+            client_capabilities = int.from_bytes(packet[13:16], "big")
+            if magic != MAGIC:
+                raise _engine_error(
+                    ErrorKind.HANDSHAKE,
+                    "handshake magic is invalid",
+                    StatusCode.ERR_MAGIC_MISMATCH,
+                    phase,
+                )
+            if version != PROTOCOL_VERSION:
+                raise _engine_error(
+                    ErrorKind.HANDSHAKE,
+                    "handshake protocol version is incompatible",
+                    StatusCode.ERR_VERSION_MISMATCH,
+                    phase,
+                )
+            if config.expected_go_pid is not None:
+                peer_pid = stream.peer_pid()
+                if pid != config.expected_go_pid or (
+                    peer_pid is not None and peer_pid != config.expected_go_pid
+                ):
+                    raise _engine_error(
+                        ErrorKind.HANDSHAKE,
+                        "Go PID does not match expected_go_pid",
+                        StatusCode.ERR_PID_MISMATCH,
+                        phase,
+                    )
+            selected = next(
+                (
+                    encoding
+                    for encoding in config.supported_encodings
+                    if encoding_mask & int(encoding)
+                ),
+                None,
+            )
+            if selected is None:
+                raise _engine_error(
+                    ErrorKind.ENCODING,
+                    "no common encoding exists",
+                    StatusCode.ERR_ENCODING_UNSUPPORTED,
+                    phase,
+                )
+            capabilities = (
+                client_capabilities
+                & config.supported_capabilities
+                & IMPLEMENTED_CAPABILITIES
+            )
+            phase = ErrorPhase.ACK_WRITE
+            stream.set_timeout(self._remaining(deadline))
+            stream.write_all(bytes([int(selected)]) + capabilities.to_bytes(3, "big"))
+            session_id = uuid.uuid4().hex
+            phase = ErrorPhase.SESSION_WRITE
+            stream.set_timeout(self._remaining(deadline))
+            stream.write_all(
+                build_control_frame({"type": "session", "session_id": session_id})
+            )
+            stream.set_timeout(None)
+            with self._state_lock:
+                if self._state != EngineState.CONNECTING:
+                    raise _engine_error(
+                        ErrorKind.SESSION_CLOSED,
+                        "connection attempt was closed locally",
+                        StatusCode.ERR_CONNECTION_LOST,
+                        ErrorPhase.CLOSE,
+                    )
+                view = SessionView(
+                    session_id,
+                    self._next_epoch + 1,
+                    selected,
+                    capabilities,
+                )
+                session = _Session(stream, view, config)
+                self._next_epoch = view.epoch
+                self._candidate = None
+                self._session = session
+                self._state = EngineState.CONNECTED
+            self._start_session(session)
+            return view
+        except EngineError as exc:
+            failure = exc
+        except TransportTimeout as exc:
+            failure = _engine_error(
+                ErrorKind.TIMEOUT,
+                str(exc),
+                StatusCode.ERR_READ_TIMEOUT,
+                phase,
+            )
+        except (TransportClosed, TransportFailure) as exc:
+            with self._state_lock:
+                locally_closed = self._state == EngineState.CLOSING
+            failure = _engine_error(
+                ErrorKind.SESSION_CLOSED if locally_closed else (
+                    ErrorKind.DIAL if phase == ErrorPhase.DIAL else ErrorKind.HANDSHAKE
+                ),
+                "connection attempt was closed locally" if locally_closed else str(exc),
+                StatusCode.ERR_CONNECTION_LOST if locally_closed else (
+                    StatusCode.ERR_PIPE_FAILED
+                    if phase == ErrorPhase.DIAL
+                    else StatusCode.ERR_CONNECTION_LOST
+                ),
+                ErrorPhase.CLOSE if locally_closed else phase,
+            )
+        except (OSError, ValueError) as exc:
+            failure = _engine_error(
+                ErrorKind.DIAL if phase == ErrorPhase.DIAL else ErrorKind.HANDSHAKE,
+                str(exc),
+                StatusCode.ERR_PIPE_FAILED
+                if phase == ErrorPhase.DIAL
+                else StatusCode.ERR_CONNECTION_LOST,
+                phase,
+            )
+        if stream is not None:
+            stream.close()
+        with self._state_lock:
+            local_close = self._state == EngineState.CLOSING
+            if self._candidate is stream:
+                self._candidate = None
+            self._state = EngineState.IDLE
+        if not local_close:
+            self._emit_pre_session_error(failure.info)
+        raise failure
 
     def close(self) -> None:
-        if getattr(self._callback_local, "active", False):
-            raise EngineError(error(ErrorCategory.INTERNAL, StatusCode.ERR_INTERNAL, ErrorPhase.CLOSE, "close cannot run synchronously from an Engine callback"))
-        with self._lifecycle_lock:
-            if not self._opened and not self._closing:
+        with self._state_lock:
+            if self._state == EngineState.IDLE:
                 return
-            if self._closing:
-                wait_for_close = True
-            else:
-                wait_for_close = False
-                self._closing = True
-                self._opened = False
-                listener, self._listener = self._listener, None
-        if wait_for_close:
-            self._closed_event.wait()
+            candidate = self._candidate
+            session = self._session
+            self._state = EngineState.CLOSING
+            if session is not None:
+                session.accepting_events = False
+                session.close_requested.set()
+                self._set_terminal(session, DisconnectReason.LOCAL_CLOSE)
+        if candidate is not None:
+            candidate.close()
+        if session is None:
             return
-        if listener is not None:
-            listener.close()
+        session.stream.close()
+        deadline = time.monotonic() + _THREAD_JOIN_TIMEOUT
+        alive: list[str] = []
+        for worker in (
+            session.reader_thread,
+            session.maintenance_thread,
+            session.dispatch_thread,
+        ):
+            if worker is None or worker is threading.current_thread():
+                continue
+            worker.join(max(0.0, deadline - time.monotonic()))
+            if worker.is_alive():
+                alive.append(worker.name)
         with self._state_lock:
-            active = list(self._connections)
-        for session in active:
-            self._request_close(session, DisconnectReason.ENGINE_CLOSE)
-        current = threading.current_thread()
-        for thread in (self._accept_thread, self._maintenance_thread):
-            if thread is not None and thread is not current:
-                thread.join()
-        while True:
-            with self._workers_lock:
-                workers = [worker for worker in self._workers if worker is not current]
-            if not workers:
-                break
-            for worker in workers:
-                worker.join()
-            if all(not worker.is_alive() for worker in workers):
-                break
+            if self._session is session:
+                self._session = None
+            self._state = EngineState.IDLE
+        if alive:
+            raise _engine_error(
+                ErrorKind.TIMEOUT,
+                f"workers did not stop before close deadline: {', '.join(alive)}",
+                StatusCode.ERR_READ_TIMEOUT,
+                ErrorPhase.CLOSE,
+                session.view.epoch,
+            )
+
+    def send(self, channel: Channel, payload: Any) -> None:
+        if channel not in (Channel.LOG, Channel.DATA):
+            current = self.session
+            raise _engine_error(
+                ErrorKind.PROTOCOL,
+                "engine applications may send only Log or Data",
+                StatusCode.ERR_PROTOCOL_VIOLATION,
+                ErrorPhase.APPLICATION_SEND,
+                current.epoch if current is not None else None,
+            )
+        session = self._require_session()
+        self._send_packet(session, channel, payload)
+
+    def _respond(self, responder: _Responder, payload: Any) -> None:
         with self._state_lock:
-            self._connections.clear()
-            self._sessions.clear()
-        with self._lifecycle_lock:
-            self._closing = False
-            self._address = None
-            self._accept_thread = None
-            self._maintenance_thread = None
-            self._closed_event.set()
+            session = self._session
+            live = (
+                self._state == EngineState.CONNECTED
+                and session is not None
+                and session.view.epoch == responder._epoch
+            )
+        if not live or session is None:
+            raise _engine_error(
+                ErrorKind.STALE_EPOCH,
+                "responder belongs to an earlier or closed epoch",
+                StatusCode.ERR_CONNECTION_LOST,
+                ErrorPhase.APPLICATION_SEND,
+                responder._epoch,
+            )
+        if not session.view.capabilities & CAP_CORRELATION:
+            raise _engine_error(
+                ErrorKind.CAPABILITY,
+                "correlation was not negotiated",
+                StatusCode.ERR_PROTOCOL_VIOLATION,
+                ErrorPhase.APPLICATION_SEND,
+                responder._epoch,
+            )
+        self._send_packet(
+            session, Channel.DATA, payload, correlation_id=responder._correlation_id
+        )
+        with session.data_lock:
+            session.responders.discard(responder)
 
-    def send(self, session: SessionHandle, channel: Channel, payload: Any) -> None:
-        self._send(session, channel, payload, None)
-
-    def send_correlated(self, session: SessionHandle, channel: Channel, correlation_id: int, payload: Any) -> None:
-        if not isinstance(correlation_id, int) or isinstance(correlation_id, bool) or not 0 <= correlation_id <= 0xFFFFFFFF:
-            raise EngineError(error(ErrorCategory.SESSION, StatusCode.ERR_PROTOCOL_VIOLATION, ErrorPhase.APPLICATION_SEND, "correlation_id must be a uint32", session))
-        self._send(session, channel, payload, correlation_id)
-
-    def _validate_config(self) -> None:
-        config = self._config
+    def _snapshot_and_validate_config(self) -> EngineConfig:
+        source = self._source_config
+        try:
+            config = EngineConfig(
+                source.endpoint_name,
+                source.token,
+                tuple(source.supported_encodings),
+                source.supported_capabilities,
+                source.expected_go_pid,
+                source.connect_timeout,
+                source.application_queue_capacity,
+                HeartbeatSettings(
+                    source.heartbeat.disabled,
+                    source.heartbeat.interval,
+                    source.heartbeat.missed_interval_limit,
+                ),
+                FragmentationSettings(
+                    source.fragmentation.timeout,
+                    source.fragmentation.active_sequence_limit,
+                ),
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise _engine_error(
+                ErrorKind.CONFIGURATION,
+                f"invalid EngineConfig: {exc}",
+                StatusCode.ERR_PROTOCOL_VIOLATION,
+                ErrorPhase.CONFIGURATION,
+            ) from exc
         cause = None
         if not valid_endpoint_name(config.endpoint_name):
             cause = "invalid endpoint_name"
         elif not valid_token(config.token):
             cause = "invalid token"
-        elif not isinstance(config.max_sessions, int) or isinstance(config.max_sessions, bool) or config.max_sessions <= 0:
-            cause = "max_sessions must be an integer greater than zero"
-        else:
-            try:
-                encodings = tuple(config.supported_encodings)
-            except TypeError:
-                encodings = ()
-            if not encodings:
-                cause = "supported_encodings must not be empty"
-            elif any(encoding not in (Encoding.JSON, Encoding.MSGPACK) for encoding in encodings):
-                cause = "supported_encodings contains an unknown value"
-            elif len(set(encodings)) != len(encodings):
-                cause = "supported_encodings contains a duplicate"
-        if cause is None and (not isinstance(config.supported_capabilities, int) or isinstance(config.supported_capabilities, bool) or config.supported_capabilities < 0 or config.supported_capabilities & ~IMPLEMENTED_CAPABILITIES):
+        elif not config.supported_encodings:
+            cause = "supported_encodings must not be empty"
+        elif any(
+            encoding not in (Encoding.JSON, Encoding.MSGPACK)
+            for encoding in config.supported_encodings
+        ):
+            cause = "supported_encodings contains an unknown value"
+        elif len(set(config.supported_encodings)) != len(config.supported_encodings):
+            cause = "supported_encodings contains a duplicate"
+        elif (
+            not isinstance(config.supported_capabilities, int)
+            or isinstance(config.supported_capabilities, bool)
+            or config.supported_capabilities < 0
+            or config.supported_capabilities & ~IMPLEMENTED_CAPABILITIES
+        ):
             cause = "supported_capabilities enables an unimplemented bit"
-        if cause is None and config.expected_pid is not None and (not isinstance(config.expected_pid, int) or isinstance(config.expected_pid, bool) or not 0 <= config.expected_pid <= 0xFFFFFFFF):
-            cause = "expected_pid must be absent or a uint32"
-        heartbeat = config.heartbeat
-        if cause is None and not heartbeat.disabled and (not isinstance(heartbeat.interval, (int, float)) or isinstance(heartbeat.interval, bool) or heartbeat.interval <= 0 or not isinstance(heartbeat.missed_interval_limit, int) or isinstance(heartbeat.missed_interval_limit, bool) or heartbeat.missed_interval_limit <= 0):
+        elif config.expected_go_pid is not None and (
+            not isinstance(config.expected_go_pid, int)
+            or isinstance(config.expected_go_pid, bool)
+            or not 0 <= config.expected_go_pid <= 0xFFFFFFFF
+        ):
+            cause = "expected_go_pid must be absent or a uint32"
+        elif (
+            not isinstance(config.connect_timeout, (int, float))
+            or isinstance(config.connect_timeout, bool)
+            or config.connect_timeout <= 0
+        ):
+            cause = "connect_timeout must be positive"
+        elif (
+            not isinstance(config.application_queue_capacity, int)
+            or isinstance(config.application_queue_capacity, bool)
+            or config.application_queue_capacity <= 0
+        ):
+            cause = "application_queue_capacity must be a positive integer"
+        elif not config.heartbeat.disabled and (
+            not isinstance(config.heartbeat.interval, (int, float))
+            or isinstance(config.heartbeat.interval, bool)
+            or config.heartbeat.interval <= 0
+            or not isinstance(config.heartbeat.missed_interval_limit, int)
+            or isinstance(config.heartbeat.missed_interval_limit, bool)
+            or config.heartbeat.missed_interval_limit <= 0
+        ):
             cause = "enabled heartbeat values must be positive"
-        fragmentation = config.fragmentation
-        if cause is None and (not isinstance(fragmentation.timeout, (int, float)) or isinstance(fragmentation.timeout, bool) or fragmentation.timeout <= 0 or not isinstance(fragmentation.active_sequence_limit, int) or isinstance(fragmentation.active_sequence_limit, bool) or fragmentation.active_sequence_limit <= 0):
+        elif (
+            not isinstance(config.fragmentation.timeout, (int, float))
+            or isinstance(config.fragmentation.timeout, bool)
+            or config.fragmentation.timeout <= 0
+            or not isinstance(config.fragmentation.active_sequence_limit, int)
+            or isinstance(config.fragmentation.active_sequence_limit, bool)
+            or config.fragmentation.active_sequence_limit <= 0
+        ):
             cause = "fragmentation values must be positive"
         if cause is not None:
-            raise EngineError(error(ErrorCategory.CONFIGURATION, StatusCode.ERR_PROTOCOL_VIOLATION, ErrorPhase.CONFIGURATION, cause))
+            raise _engine_error(
+                ErrorKind.CONFIGURATION,
+                cause,
+                StatusCode.ERR_PROTOCOL_VIOLATION,
+                ErrorPhase.CONFIGURATION,
+            )
+        return config
 
-    def _accept_loop(self) -> None:
-        while self._opened:
-            listener = self._listener
-            if listener is None:
-                return
-            try:
-                stream = listener.accept()
-            except TransportClosed:
-                return
-            except TransportFailure as exc:
-                if self._opened:
-                    self._emit_error(error(ErrorCategory.ENDPOINT, StatusCode.ERR_PIPE_FAILED, ErrorPhase.ACCEPT, str(exc)))
-                continue
-            session = _Session(stream)
-            with self._state_lock:
-                admitted = len(self._connections) < self._config.max_sessions
-                if admitted:
-                    self._connections.add(session)
-            if not admitted:
-                stream.close()
-                continue
-            worker = threading.Thread(target=self._session_worker, args=(session,), name="yuumi-engine-session", daemon=True)
-            with self._workers_lock:
-                self._workers.add(worker)
-            worker.start()
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TransportTimeout("connect and handshake attempt timed out")
+        return remaining
 
-    def _session_worker(self, session: _Session) -> None:
-        try:
-            try:
-                if not self._handshake(session):
-                    return
-                self._read_loop(session)
-            finally:
-                session.stream.close()
-                with self._state_lock:
-                    self._connections.discard(session)
-                    if session.handle is not None:
-                        self._sessions.pop(session.handle.session_id, None)
-                    session.fragments.clear()
-                    session.pending_correlations.clear()
-                if session.established and session.handle is not None:
-                    self._emit_disconnected(session)
-        finally:
-            with self._workers_lock:
-                self._workers.discard(threading.current_thread())
-
-    def _handshake(self, session: _Session) -> bool:
-        try:
-            packet = session.stream.read_exact(16)
-        except (TransportClosed, TransportFailure) as exc:
-            self._emit_error(error(ErrorCategory.HANDSHAKE, StatusCode.ERR_CONNECTION_LOST, ErrorPhase.HANDSHAKE_READ, str(exc)))
-            return False
-        magic, version, pid, encoding_mask = struct.unpack(">IIIB", packet[:13])
-        client_capabilities = int.from_bytes(packet[13:16], "big")
-        if magic != MAGIC:
-            self._emit_error(error(ErrorCategory.HANDSHAKE, StatusCode.ERR_MAGIC_MISMATCH, ErrorPhase.HANDSHAKE_VALIDATE, "handshake magic is invalid"))
-            return False
-        if version != PROTOCOL_VERSION:
-            self._emit_error(error(ErrorCategory.HANDSHAKE, StatusCode.ERR_VERSION_MISMATCH, ErrorPhase.HANDSHAKE_VALIDATE, "handshake protocol version is incompatible"))
-            return False
-        expected_pid = self._config.expected_pid
-        if expected_pid is not None:
-            try:
-                peer_pid = session.stream.peer_pid()
-            except TransportFailure as exc:
-                self._emit_error(error(ErrorCategory.HANDSHAKE, StatusCode.ERR_PIPE_FAILED, ErrorPhase.HANDSHAKE_VALIDATE, str(exc)))
-                return False
-            if pid != expected_pid or (peer_pid is not None and peer_pid != expected_pid):
-                self._emit_error(error(ErrorCategory.HANDSHAKE, StatusCode.ERR_PID_MISMATCH, ErrorPhase.HANDSHAKE_VALIDATE, "client PID does not match expected_pid"))
-                return False
-        selected = next((encoding for encoding in self._config.supported_encodings if encoding_mask & int(encoding)), None)
-        if selected is None:
-            self._emit_error(error(ErrorCategory.HANDSHAKE, StatusCode.ERR_ENCODING_UNSUPPORTED, ErrorPhase.HANDSHAKE_VALIDATE, "no common encoding exists"))
-            return False
-        capabilities = client_capabilities & self._config.supported_capabilities & IMPLEMENTED_CAPABILITIES
-        try:
-            session.stream.write_all(bytes([int(selected)]) + capabilities.to_bytes(3, "big"))
-        except (TransportClosed, TransportFailure) as exc:
-            self._emit_error(error(ErrorCategory.TRANSPORT, StatusCode.ERR_WRITE_FAILED, ErrorPhase.ACK_WRITE, str(exc)))
-            return False
-        session_id = uuid.uuid4().hex
-        try:
-            session.stream.write_all(build_control_frame({"type": "session", "session_id": session_id}))
-        except (TransportClosed, TransportFailure, ProtocolFailure) as exc:
-            self._emit_error(error(ErrorCategory.TRANSPORT, StatusCode.ERR_WRITE_FAILED, ErrorPhase.SESSION_WRITE, str(exc)))
-            return False
-        with self._state_lock:
-            if not self._opened or session.close_requested.is_set():
-                return False
-            session.handle = SessionHandle(session_id, self._next_epoch)
-            self._next_epoch += 1
-            session.encoding = selected
-            session.capabilities = capabilities
-            session.established = True
-            session.last_activity = time.monotonic()
-            session.last_heartbeat = session.last_activity
-            self._sessions[session_id] = session
-        self._emit_connected(session)
-        return True
+    def _start_session(self, session: _Session) -> None:
+        epoch = session.view.epoch
+        session.dispatch_thread = threading.Thread(
+            target=self._dispatch_loop,
+            args=(session,),
+            name=f"yuumi-engine-dispatch-{epoch}",
+            daemon=True,
+        )
+        session.reader_thread = threading.Thread(
+            target=self._read_loop,
+            args=(session,),
+            name=f"yuumi-engine-reader-{epoch}",
+            daemon=True,
+        )
+        session.maintenance_thread = threading.Thread(
+            target=self._maintenance_loop,
+            args=(session,),
+            name=f"yuumi-engine-maintenance-{epoch}",
+            daemon=True,
+        )
+        session.dispatch_thread.start()
+        self._enqueue_application(
+            session, _DispatchItem("connected", session.view, True)
+        )
+        session.reader_thread.start()
+        session.maintenance_thread.start()
 
     def _read_loop(self, session: _Session) -> None:
-        while not session.close_requested.is_set():
-            try:
+        try:
+            while not session.close_requested.is_set():
                 header = session.stream.read_exact(6)
                 length, raw_channel, flags = struct.unpack(">IBB", header)
                 if length > MAX_MESSAGE_SIZE:
-                    raise ProtocolFailure(StatusCode.ERR_PAYLOAD_TOO_LARGE, "frame payload exceeds 16 MiB")
+                    raise ProtocolFailure(
+                        StatusCode.ERR_PAYLOAD_TOO_LARGE,
+                        "frame payload exceeds 16 MiB",
+                    )
                 payload = session.stream.read_exact(length)
                 session.last_activity = time.monotonic()
                 self._process_frame(session, raw_channel, flags, payload)
-            except ProtocolFailure as exc:
-                self._protocol_failure(session, exc.status, exc.cause, exc.phase)
-                return
-            except TransportClosed:
-                return
-            except TransportFailure as exc:
-                if not session.close_requested.is_set():
-                    self._report_terminal(session, error(ErrorCategory.TRANSPORT, StatusCode.ERR_CONNECTION_LOST, ErrorPhase.FRAME_READ, str(exc), session.handle))
-                    self._request_close(session, DisconnectReason.TRANSPORT_FAILURE)
-                return
+        except ProtocolFailure as exc:
+            self._protocol_failure(session, exc)
+        except TransportClosed:
+            pass
+        except TransportTimeout as exc:
+            if not session.close_requested.is_set():
+                self._set_terminal(
+                    session,
+                    DisconnectReason.TRANSPORT_FAILURE,
+                    _error(
+                        ErrorKind.TIMEOUT,
+                        str(exc),
+                        StatusCode.ERR_READ_TIMEOUT,
+                        ErrorPhase.FRAME_READ,
+                        session.view.epoch,
+                    ),
+                )
+                session.stream.close()
+        except TransportFailure as exc:
+            if not session.close_requested.is_set():
+                self._set_terminal(
+                    session,
+                    DisconnectReason.TRANSPORT_FAILURE,
+                    _error(
+                        ErrorKind.TRANSPORT,
+                        str(exc),
+                        StatusCode.ERR_CONNECTION_LOST,
+                        ErrorPhase.FRAME_READ,
+                        session.view.epoch,
+                    ),
+                )
+                session.stream.close()
+        except Exception as exc:
+            if not session.close_requested.is_set():
+                self._set_terminal(
+                    session,
+                    DisconnectReason.TRANSPORT_FAILURE,
+                    _error(
+                        ErrorKind.INTERNAL,
+                        str(exc),
+                        StatusCode.ERR_INTERNAL,
+                        ErrorPhase.FRAME_DECODE,
+                        session.view.epoch,
+                    ),
+                )
+                session.stream.close()
+        finally:
+            self._finalize(session)
 
-    def _process_frame(self, session: _Session, raw_channel: int, flags: int, payload: bytes) -> None:
+    def _process_frame(
+        self, session: _Session, raw_channel: int, flags: int, payload: bytes
+    ) -> None:
         try:
             channel = Channel(raw_channel)
         except ValueError as exc:
-            raise ProtocolFailure(StatusCode.ERR_PROTOCOL_VIOLATION, "frame channel is unknown") from exc
-        if flags & ~KNOWN_FLAGS or flags & FLAG_LAST_FRAGMENT and not flags & FLAG_FRAGMENT:
-            raise ProtocolFailure(StatusCode.ERR_PROTOCOL_VIOLATION, "frame flags are invalid")
+            raise ProtocolFailure(
+                StatusCode.ERR_PROTOCOL_VIOLATION, "frame channel is unknown"
+            ) from exc
+        if flags & ~KNOWN_FLAGS or (
+            flags & FLAG_LAST_FRAGMENT and not flags & FLAG_FRAGMENT
+        ):
+            raise ProtocolFailure(
+                StatusCode.ERR_PROTOCOL_VIOLATION, "frame flags are invalid"
+            )
         if channel == Channel.LOG:
-            raise ProtocolFailure(StatusCode.ERR_PROTOCOL_VIOLATION, "Log is not valid client-to-engine traffic")
+            raise ProtocolFailure(
+                StatusCode.ERR_PROTOCOL_VIOLATION,
+                "Log is not valid Go-to-engine traffic",
+            )
         if channel == Channel.CONTROL:
             if flags != 0:
-                raise ProtocolFailure(StatusCode.ERR_PROTOCOL_VIOLATION, "Control frames cannot carry application flags")
+                raise ProtocolFailure(
+                    StatusCode.ERR_PROTOCOL_VIOLATION,
+                    "Control frames cannot carry application flags",
+                )
             self._process_control(session, payload)
             return
-        correlated = bool(flags & FLAG_CORRELATED)
         fragmented = bool(flags & FLAG_FRAGMENT)
-        if correlated and not session.capabilities & CAP_CORRELATION:
-            raise ProtocolFailure(StatusCode.ERR_PROTOCOL_VIOLATION, "correlation was not negotiated")
+        correlated = bool(flags & FLAG_CORRELATED)
+        if correlated and not session.view.capabilities & CAP_CORRELATION:
+            raise ProtocolFailure(
+                StatusCode.ERR_PROTOCOL_VIOLATION,
+                "correlation was not negotiated",
+            )
         offset = 0
         fragment_id = None
         correlation_id = None
         if fragmented:
             if len(payload) < 4:
-                raise ProtocolFailure(StatusCode.ERR_PROTOCOL_VIOLATION, "fragment prefix is shorter than four bytes")
+                raise ProtocolFailure(
+                    StatusCode.ERR_PROTOCOL_VIOLATION,
+                    "fragment prefix is shorter than four bytes",
+                )
             fragment_id = struct.unpack_from(">I", payload, offset)[0]
             offset += 4
         if correlated:
             if len(payload) - offset < 4:
-                raise ProtocolFailure(StatusCode.ERR_PROTOCOL_VIOLATION, "correlation prefix is shorter than four bytes")
+                raise ProtocolFailure(
+                    StatusCode.ERR_PROTOCOL_VIOLATION,
+                    "correlation prefix is shorter than four bytes",
+                )
             correlation_id = struct.unpack_from(">I", payload, offset)[0]
             offset += 4
         data = payload[offset:]
         if fragmented:
-            self._process_fragment(session, channel, flags, fragment_id, correlation_id, data)
+            self._process_fragment(
+                session, channel, flags, fragment_id, correlation_id, data
+            )
             return
-        with session.fragment_lock:
+        with session.data_lock:
             if channel in session.fragments:
-                raise ProtocolFailure(StatusCode.ERR_PROTOCOL_VIOLATION, "fragment sequences cannot be interleaved on one channel")
-        decoded = decode_payload(data, session.encoding)
-        self._emit_message(session, MessageEvent(session.handle, channel, decoded, correlation_id))
+                raise ProtocolFailure(
+                    StatusCode.ERR_PROTOCOL_VIOLATION,
+                    "fragment sequences cannot be interleaved on one channel",
+                    ErrorPhase.FRAGMENTATION,
+                )
+        self._deliver_message(
+            session,
+            channel,
+            decode_payload(data, session.view.encoding),
+            correlation_id,
+        )
 
-    def _process_fragment(self, session: _Session, channel: Channel, flags: int, fragment_id: int, correlation_id: int | None, data: bytes) -> None:
+    def _process_fragment(
+        self,
+        session: _Session,
+        channel: Channel,
+        flags: int,
+        fragment_id: int,
+        correlation_id: int | None,
+        data: bytes,
+    ) -> None:
         complete = None
-        with session.fragment_lock:
+        with session.data_lock:
             fragment = session.fragments.get(channel)
             if fragment is None:
-                if len(session.fragments) >= self._config.fragmentation.active_sequence_limit:
-                    raise ProtocolFailure(StatusCode.ERR_PROTOCOL_VIOLATION, "active fragment-sequence limit exceeded", ErrorPhase.FRAGMENTATION)
-                fragment = _Fragment(fragment_id, correlation_id, bytearray(), time.monotonic() + self._config.fragmentation.timeout)
+                if len(session.fragments) >= session.config.fragmentation.active_sequence_limit:
+                    raise ProtocolFailure(
+                        StatusCode.ERR_PROTOCOL_VIOLATION,
+                        "active fragment-sequence limit exceeded",
+                        ErrorPhase.FRAGMENTATION,
+                    )
+                fragment = _Fragment(
+                    fragment_id,
+                    correlation_id,
+                    bytearray(),
+                    time.monotonic() + session.config.fragmentation.timeout,
+                )
                 session.fragments[channel] = fragment
-            elif fragment.fragment_id != fragment_id or fragment.correlation_id != correlation_id:
-                raise ProtocolFailure(StatusCode.ERR_PROTOCOL_VIOLATION, "fragment sequence prefixes changed or interleaved", ErrorPhase.FRAGMENTATION)
-            if len(fragment.data) + len(data) > MAX_MESSAGE_SIZE:
+            elif (
+                fragment.identifier != fragment_id
+                or fragment.correlation_id != correlation_id
+            ):
                 session.fragments.pop(channel, None)
-                raise ProtocolFailure(StatusCode.ERR_PAYLOAD_TOO_LARGE, "reassembled message exceeds 16 MiB", ErrorPhase.FRAGMENTATION)
+                raise ProtocolFailure(
+                    StatusCode.ERR_PROTOCOL_VIOLATION,
+                    "fragment sequence prefixes changed or interleaved",
+                    ErrorPhase.FRAGMENTATION,
+                )
+            if len(fragment.data) > MAX_MESSAGE_SIZE - len(data):
+                session.fragments.pop(channel, None)
+                raise ProtocolFailure(
+                    StatusCode.ERR_PAYLOAD_TOO_LARGE,
+                    "reassembled message exceeds 16 MiB",
+                    ErrorPhase.FRAGMENTATION,
+                )
             fragment.data.extend(data)
             if flags & FLAG_LAST_FRAGMENT:
                 complete = bytes(fragment.data)
                 session.fragments.pop(channel, None)
         if complete is not None:
-            decoded = decode_payload(complete, session.encoding)
-            self._emit_message(session, MessageEvent(session.handle, channel, decoded, correlation_id))
+            self._deliver_message(
+                session,
+                channel,
+                decode_payload(complete, session.view.encoding),
+                correlation_id,
+            )
+
+    def _deliver_message(
+        self,
+        session: _Session,
+        channel: Channel,
+        payload: Any,
+        correlation_id: int | None,
+    ) -> None:
+        responder = None
+        if correlation_id is not None:
+            responder = _Responder(self, session.view.epoch, correlation_id)
+            with session.data_lock:
+                session.responders.add(responder)
+        event = MessageEvent(
+            session.view, channel, payload, correlation_id, responder
+        )
+        self._enqueue_application(session, _DispatchItem("message", event, True))
 
     def _process_control(self, session: _Session, payload: bytes) -> None:
         value = decode_control(payload)
         control_type = value["type"]
-        if control_type == "ping":
+        if control_type == "heartbeat":
+            timestamp = value.get("ts")
+            if not isinstance(timestamp, int) or isinstance(timestamp, bool):
+                timestamp = int(time.time() * 1000)
+            self._enqueue_application(
+                session,
+                _DispatchItem(
+                    "heartbeat", HeartbeatEvent(session.view, timestamp), True
+                ),
+            )
+        elif control_type == "ping":
             self._write_control(session, {"type": "pong", "seq": value.get("seq")})
         elif control_type == "error":
-            raw_status = value.get("code")
             try:
-                status = StatusCode(raw_status)
+                status = StatusCode(value.get("code"))
             except (TypeError, ValueError) as exc:
-                raise ProtocolFailure(StatusCode.ERR_PROTOCOL_VIOLATION, "Control error code is invalid") from exc
-            cause = value.get("message") if isinstance(value.get("message"), str) else "peer reported a protocol error"
-            self._report_terminal(session, error(ErrorCategory.PROTOCOL, status, ErrorPhase.FRAME_DECODE, cause, session.handle))
-            self._request_close(session, DisconnectReason.PROTOCOL_FAILURE)
+                raise ProtocolFailure(
+                    StatusCode.ERR_PROTOCOL_VIOLATION,
+                    "Control error code is invalid",
+                ) from exc
+            cause = (
+                value["message"]
+                if isinstance(value.get("message"), str)
+                else "Go peer reported a protocol error"
+            )
+            self._set_terminal(
+                session,
+                DisconnectReason.PROTOCOL_FAILURE,
+                _error(
+                    ErrorKind.PROTOCOL,
+                    cause,
+                    status,
+                    ErrorPhase.FRAME_DECODE,
+                    session.view.epoch,
+                ),
+            )
+            session.close_requested.set()
+            session.accepting_events = False
+            session.stream.close()
 
-    def _maintenance_loop(self) -> None:
-        while self._opened:
-            time.sleep(0.05)
+    def _maintenance_loop(self, session: _Session) -> None:
+        heartbeat = session.config.heartbeat
+        period = min(
+            0.05,
+            session.config.fragmentation.timeout,
+            0.05 if heartbeat.disabled else heartbeat.interval,
+        )
+        period = max(0.001, period)
+        while not session.close_requested.wait(period):
             now = time.monotonic()
-            with self._state_lock:
-                sessions = list(self._sessions.values())
-            for session in sessions:
-                if session.close_requested.is_set():
-                    continue
-                expired = 0
-                with session.fragment_lock:
-                    for channel, fragment in list(session.fragments.items()):
-                        if fragment.deadline <= now:
-                            session.fragments.pop(channel, None)
-                            expired += 1
-                for _ in range(expired):
-                    self._emit_session_error(session, error(ErrorCategory.PROTOCOL, StatusCode.ERR_FRAGMENT_TIMEOUT, ErrorPhase.FRAGMENTATION, "incomplete fragment sequence expired", session.handle))
-                heartbeat = self._config.heartbeat
-                if heartbeat.disabled:
-                    continue
-                if now - session.last_activity >= heartbeat.interval * heartbeat.missed_interval_limit:
-                    self._report_terminal(session, error(ErrorCategory.TRANSPORT, StatusCode.ERR_READ_TIMEOUT, ErrorPhase.HEARTBEAT, "session heartbeat deadline expired", session.handle))
-                    self._request_close(session, DisconnectReason.HEARTBEAT_TIMEOUT)
-                elif now - session.last_heartbeat >= heartbeat.interval:
-                    try:
-                        self._write_control(session, {"type": "heartbeat", "ts": int(time.time() * 1000)})
-                        session.last_heartbeat = now
-                    except EngineError as exc:
-                        self._report_terminal(session, exc.info)
-                        self._request_close(session, DisconnectReason.TRANSPORT_FAILURE)
+            expired = 0
+            with session.data_lock:
+                for channel, fragment in list(session.fragments.items()):
+                    if fragment.deadline <= now:
+                        session.fragments.pop(channel, None)
+                        expired += 1
+            for _ in range(expired):
+                self._enqueue_application(
+                    session,
+                    _DispatchItem(
+                        "error",
+                        _error(
+                            ErrorKind.TIMEOUT,
+                            "incomplete fragment sequence expired",
+                            StatusCode.ERR_FRAGMENT_TIMEOUT,
+                            ErrorPhase.FRAGMENTATION,
+                            session.view.epoch,
+                        ),
+                        True,
+                    ),
+                )
+            if heartbeat.disabled:
+                continue
+            if now - session.last_activity >= (
+                heartbeat.interval * heartbeat.missed_interval_limit
+            ):
+                self._set_terminal(
+                    session,
+                    DisconnectReason.HEARTBEAT_TIMEOUT,
+                    _error(
+                        ErrorKind.TIMEOUT,
+                        "session heartbeat deadline expired",
+                        StatusCode.ERR_READ_TIMEOUT,
+                        ErrorPhase.HEARTBEAT,
+                        session.view.epoch,
+                    ),
+                )
+                session.close_requested.set()
+                session.accepting_events = False
+                session.stream.close()
+                return
+            if now - session.last_heartbeat >= heartbeat.interval:
+                session.last_heartbeat = now
+                try:
+                    self._write_control(
+                        session,
+                        {"type": "heartbeat", "ts": int(time.time() * 1000)},
+                    )
+                except EngineError as exc:
+                    self._set_terminal(
+                        session, DisconnectReason.TRANSPORT_FAILURE, exc.info
+                    )
+                    session.close_requested.set()
+                    session.accepting_events = False
+                    session.stream.close()
+                    return
 
-    def _send(self, handle: SessionHandle, channel: Channel, payload: Any, correlation_id: int | None) -> None:
-        if channel not in (Channel.LOG, Channel.DATA):
-            raise EngineError(error(ErrorCategory.SESSION, StatusCode.ERR_PROTOCOL_VIOLATION, ErrorPhase.APPLICATION_SEND, "engine applications may send only Log or Data", handle))
+    def _require_session(self) -> _Session:
         with self._state_lock:
-            session = self._sessions.get(handle.session_id) if isinstance(handle, SessionHandle) else None
-            if session is None or session.handle != handle or session.close_requested.is_set():
-                session = None
-        if session is None:
-            raise EngineError(error(ErrorCategory.SESSION, StatusCode.ERR_CONNECTION_LOST, ErrorPhase.APPLICATION_SEND, "session handle is absent, closed, or stale", handle if isinstance(handle, SessionHandle) else None))
-        if correlation_id is not None and not session.capabilities & CAP_CORRELATION:
-            raise EngineError(error(ErrorCategory.SESSION, StatusCode.ERR_PROTOCOL_VIOLATION, ErrorPhase.APPLICATION_SEND, "correlation was not negotiated", handle))
+            session = self._session
+            valid = (
+                self._state == EngineState.CONNECTED
+                and session is not None
+                and not session.close_requested.is_set()
+                and not session.finalized
+            )
+        if not valid or session is None:
+            raise _engine_error(
+                ErrorKind.SESSION_CLOSED,
+                "engine has no live session",
+                StatusCode.ERR_CONNECTION_LOST,
+                ErrorPhase.APPLICATION_SEND,
+                None if session is None else session.view.epoch,
+            )
+        return session
+
+    def _send_packet(
+        self,
+        session: _Session,
+        channel: Channel,
+        payload: Any,
+        correlation_id: int | None = None,
+    ) -> None:
+        with self._state_lock:
+            live = (
+                self._session is session
+                and self._state == EngineState.CONNECTED
+                and not session.close_requested.is_set()
+                and not session.finalized
+            )
+        if not live:
+            raise _engine_error(
+                ErrorKind.STALE_EPOCH,
+                "operation belongs to an earlier or closed epoch",
+                StatusCode.ERR_CONNECTION_LOST,
+                ErrorPhase.APPLICATION_SEND,
+                session.view.epoch,
+            )
         try:
-            encoded = encode_payload(payload, session.encoding)
-            prefix = struct.pack(">I", correlation_id) if correlation_id is not None else b""
+            encoded = encode_payload(payload, session.view.encoding)
+            prefix = b"" if correlation_id is None else struct.pack(">I", correlation_id)
             if len(encoded) > MAX_MESSAGE_SIZE - len(prefix):
-                raise ProtocolFailure(StatusCode.ERR_PAYLOAD_TOO_LARGE, "encoded frame exceeds 16 MiB", ErrorPhase.APPLICATION_SEND)
-            packet = build_frame(channel, FLAG_CORRELATED if correlation_id is not None else 0, prefix + encoded)
+                raise ProtocolFailure(
+                    StatusCode.ERR_PAYLOAD_TOO_LARGE,
+                    "encoded frame exceeds 16 MiB",
+                    ErrorPhase.APPLICATION_SEND,
+                )
+            packet = build_frame(
+                channel,
+                0 if correlation_id is None else FLAG_CORRELATED,
+                prefix + encoded,
+            )
         except ProtocolFailure as exc:
-            raise EngineError(error(ErrorCategory.SERIALIZATION, exc.status, exc.phase, exc.cause, handle)) from exc
-        self._write_packet(session, packet, ErrorPhase.FRAME_WRITE)
-
-    def _write_control(self, session: _Session, value: dict[str, Any]) -> None:
-        self._write_packet(session, build_control_frame(value), ErrorPhase.FRAME_WRITE)
-
-    def _write_packet(self, session: _Session, packet: bytes, phase: ErrorPhase) -> None:
+            raise _engine_error(
+                ErrorKind.ENCODING
+                if exc.status == StatusCode.ERR_ENCODING_UNSUPPORTED
+                else ErrorKind.PROTOCOL,
+                exc.cause,
+                exc.status,
+                exc.phase,
+                session.view.epoch,
+            ) from exc
         with session.send_lock:
-            if session.close_requested.is_set():
-                raise EngineError(error(ErrorCategory.SESSION, StatusCode.ERR_CONNECTION_LOST, phase, "session is closing", session.handle))
+            if session.close_requested.is_set() or session.finalized:
+                raise _engine_error(
+                    ErrorKind.STALE_EPOCH,
+                    "operation belongs to an earlier or closed epoch",
+                    StatusCode.ERR_CONNECTION_LOST,
+                    ErrorPhase.APPLICATION_SEND,
+                    session.view.epoch,
+                )
             try:
                 session.stream.write_all(packet)
             except (TransportClosed, TransportFailure) as exc:
-                failure = error(ErrorCategory.TRANSPORT, StatusCode.ERR_WRITE_FAILED, phase, str(exc), session.handle)
-                self._report_terminal(session, failure)
-                self._request_close(session, DisconnectReason.TRANSPORT_FAILURE)
+                failure = _error(
+                    ErrorKind.TRANSPORT,
+                    str(exc),
+                    StatusCode.ERR_WRITE_FAILED,
+                    ErrorPhase.FRAME_WRITE,
+                    session.view.epoch,
+                )
+                self._set_terminal(
+                    session, DisconnectReason.TRANSPORT_FAILURE, failure
+                )
+                session.close_requested.set()
+                session.accepting_events = False
+                session.stream.close()
                 raise EngineError(failure) from exc
 
-    def _protocol_failure(self, session: _Session, status: StatusCode, cause: str, phase: ErrorPhase) -> None:
-        self._report_terminal(session, error(ErrorCategory.PROTOCOL, status, phase, cause, session.handle))
+    def _write_control(self, session: _Session, value: dict[str, Any]) -> None:
+        packet = build_control_frame(value)
+        with session.send_lock:
+            if session.finalized:
+                raise _engine_error(
+                    ErrorKind.STALE_EPOCH,
+                    "operation belongs to an earlier or closed epoch",
+                    StatusCode.ERR_CONNECTION_LOST,
+                    ErrorPhase.FRAME_WRITE,
+                    session.view.epoch,
+                )
+            try:
+                session.stream.write_all(packet)
+            except (TransportClosed, TransportFailure) as exc:
+                raise _engine_error(
+                    ErrorKind.TRANSPORT,
+                    str(exc),
+                    StatusCode.ERR_WRITE_FAILED,
+                    ErrorPhase.FRAME_WRITE,
+                    session.view.epoch,
+                ) from exc
+
+    def _protocol_failure(
+        self, session: _Session, failure: ProtocolFailure
+    ) -> None:
+        self._set_terminal(
+            session,
+            DisconnectReason.PROTOCOL_FAILURE,
+            _error(
+                ErrorKind.PROTOCOL,
+                failure.cause,
+                failure.status,
+                failure.phase,
+                session.view.epoch,
+            ),
+        )
+        session.close_requested.set()
+        session.accepting_events = False
         try:
-            self._write_control(session, {"type": "error", "code": int(status), "message": cause})
+            self._write_control(
+                session,
+                {
+                    "type": "error",
+                    "code": int(failure.status),
+                    "message": failure.cause,
+                },
+            )
         except EngineError:
             pass
-        self._request_close(session, DisconnectReason.PROTOCOL_FAILURE)
+        session.stream.close()
 
-    def _request_close(self, session: _Session, reason: DisconnectReason) -> None:
-        if not session.close_requested.is_set():
-            session.close_reason = reason
-            session.close_requested.set()
+    def _set_terminal(
+        self,
+        session: _Session,
+        reason: DisconnectReason,
+        failure: ErrorInfo | None = None,
+    ) -> None:
+        with session.data_lock:
+            if (
+                session.terminal.error is not None
+                or session.terminal.reason != DisconnectReason.PEER_CLOSE
+            ):
+                return
+            session.terminal = TerminalResult(reason, failure)
+
+    def _enqueue_application(
+        self, session: _Session, item: _DispatchItem
+    ) -> bool:
+        overflow = False
+        with session.event_condition:
+            if not session.accepting_events or session.finalized:
+                return False
+            if (
+                item.uses_capacity
+                and session.capacity_used
+                >= session.config.application_queue_capacity
+            ):
+                session.accepting_events = False
+                session.close_requested.set()
+                overflow = True
+            else:
+                session.events.append(item)
+                if item.uses_capacity:
+                    session.capacity_used += 1
+                session.event_condition.notify()
+        if overflow:
+            self._set_terminal(
+                session,
+                DisconnectReason.BACKPRESSURE,
+                _error(
+                    ErrorKind.BACKPRESSURE,
+                    "application queue capacity exhausted",
+                    StatusCode.ERR_INTERNAL,
+                    ErrorPhase.APPLICATION_DISPATCH,
+                    session.view.epoch,
+                ),
+            )
             session.stream.close()
+            return False
+        return True
 
-    def _report_terminal(self, session: _Session, failure: ErrorInfo) -> None:
-        if not session.terminal_reported.is_set():
-            session.terminal_reported.set()
-            self._emit_session_error(session, failure)
+    @staticmethod
+    def _enqueue_terminal(session: _Session, item: _DispatchItem) -> None:
+        with session.event_condition:
+            session.events.append(item)
+            session.event_condition.notify()
 
-    def _handler(self, name: str):
+    def _dispatch_loop(self, session: _Session) -> None:
+        while True:
+            with session.event_condition:
+                while not session.events and not session.transport_finalized:
+                    session.event_condition.wait()
+                if not session.events and session.transport_finalized:
+                    return
+                item = session.events.popleft()
+            try:
+                handler = self._handler_for(item.kind)
+                if handler is not None:
+                    result = handler(item.value)
+                    if inspect.isawaitable(result):
+                        close = getattr(result, "close", None)
+                        if close is not None:
+                            close()
+                        raise TypeError(
+                            "Python Engine callbacks must be synchronous callables"
+                        )
+            except BaseException as exc:
+                if item.kind in ("error", "disconnected"):
+                    self._report_uncaught(exc)
+                else:
+                    self._enqueue_terminal(
+                        session,
+                        _DispatchItem(
+                            "error",
+                            _error(
+                                ErrorKind.APPLICATION,
+                                str(exc),
+                                StatusCode.ERR_INTERNAL,
+                                ErrorPhase.APPLICATION_DISPATCH,
+                                session.view.epoch,
+                            ),
+                            False,
+                        ),
+                    )
+            finally:
+                if item.uses_capacity:
+                    with session.event_condition:
+                        session.capacity_used -= 1
+
+    def _handler_for(self, kind: str):
         with self._handlers_lock:
-            return getattr(self, name)
+            return {
+                "connected": self._connected_handler,
+                "message": self._message_handler,
+                "heartbeat": self._heartbeat_handler,
+                "error": self._error_handler,
+                "disconnected": self._disconnected_handler,
+            }[kind]
 
-    def _invoke(self, handler, value) -> None:
+    def _emit_pre_session_error(self, failure: ErrorInfo) -> None:
+        handler = self._handler_for("error")
         if handler is None:
             return
-        self._callback_local.active = True
         try:
-            handler(value)
-        finally:
-            self._callback_local.active = False
+            result = handler(failure)
+            if inspect.isawaitable(result):
+                close = getattr(result, "close", None)
+                if close is not None:
+                    close()
+                raise TypeError("Python Engine callbacks must be synchronous callables")
+        except BaseException as exc:
+            self._report_uncaught(exc)
 
-    def _emit_connected(self, session: _Session) -> None:
-        with session.event_lock:
-            self._invoke(self._handler("_connected_handler"), SessionView(session.handle, session.encoding, session.capabilities))
+    @staticmethod
+    def _report_uncaught(exc: BaseException) -> None:
+        arguments = threading.ExceptHookArgs(
+            (type(exc), exc, exc.__traceback__, threading.current_thread())
+        )
+        threading.excepthook(arguments)
 
-    def _emit_message(self, session: _Session, event: MessageEvent) -> None:
-        with session.event_lock:
-            self._invoke(self._handler("_message_handler"), event)
-
-    def _emit_error(self, failure: ErrorInfo) -> None:
-        self._invoke(self._handler("_error_handler"), failure)
-
-    def _emit_session_error(self, session: _Session, failure: ErrorInfo) -> None:
-        with session.event_lock:
-            self._emit_error(failure)
-
-    def _emit_disconnected(self, session: _Session) -> None:
-        with session.event_lock:
-            self._invoke(self._handler("_disconnected_handler"), DisconnectEvent(session.handle, session.close_reason))
+    def _finalize(self, session: _Session) -> None:
+        with session.finalize_lock:
+            if session.finalized:
+                return
+            session.finalized = True
+            session.accepting_events = False
+            session.close_requested.set()
+            session.stream.close()
+            with session.data_lock:
+                session.fragments.clear()
+                for responder in session.responders:
+                    responder.invalidate()
+                session.responders.clear()
+            with self._state_lock:
+                if self._session is session:
+                    self._session = None
+                self._terminal_result = session.terminal
+                if self._state != EngineState.CLOSING:
+                    self._state = EngineState.IDLE
+            if session.terminal.error is not None:
+                self._enqueue_terminal(
+                    session,
+                    _DispatchItem("error", session.terminal.error, False),
+                )
+            self._enqueue_terminal(
+                session,
+                _DispatchItem(
+                    "disconnected",
+                    DisconnectEvent(session.view, session.terminal),
+                    False,
+                ),
+            )
+            with session.event_condition:
+                session.transport_finalized = True
+                session.event_condition.notify_all()
 
 
 """
-Engine callbacks execute synchronously on the session worker that produced the
-event; timer-generated errors execute on the maintenance worker. Events for one
-session are serialized by a per-session lock, while separate sessions may run
-callbacks concurrently. Sequential sends to one session are serialized by its
-write lock; concurrent sends follow lock-acquisition order. Every SDK-owned
-thread is explicitly daemonized, and close waits for owned workers to finish.
+The reader parses frames and answers Control traffic, the maintenance worker
+owns heartbeat and fragment deadlines, and one dispatcher invokes application
+callbacks in order. The bounded queue counts callbacks that are queued or
+currently running; two terminal events bypass that capacity so backpressure is
+always observable before disconnection. Stream.close unblocks I/O and every
+worker observes close_requested before close joins it.
 """

@@ -6,7 +6,7 @@ from typing import Any
 
 import msgpack
 
-from .types import Channel, Encoding, ErrorCategory, ErrorInfo, ErrorPhase, MAX_MESSAGE_SIZE, StatusCode
+from .types import Channel, Encoding, ErrorPhase, MAX_MESSAGE_SIZE, StatusCode
 
 FLAG_FRAGMENT = 0x01
 FLAG_LAST_FRAGMENT = 0x02
@@ -24,10 +24,6 @@ class ProtocolFailure(Exception):
         self.status = status
         self.cause = cause
         self.phase = phase
-
-
-def error(category: ErrorCategory, status: StatusCode, phase: ErrorPhase, cause: str, session=None) -> ErrorInfo:
-    return ErrorInfo(category, status, phase, cause, session)
 
 
 def encode_payload(value: Any, encoding: Encoding) -> bytes:
