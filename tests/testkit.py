@@ -14,6 +14,8 @@ from yuumi.transport import SocketStream, Stream, resolve_transport_address
 TOKEN = "0123456789abcdef0123456789abcdef"
 ROOT = Path(__file__).resolve().parents[2]
 VECTORS = ROOT / "yuumi-spec" / "test-vectors"
+TEST_TIMEOUT = 2.0
+POLL_INTERVAL = 0.005
 _sequence = 0
 
 
@@ -68,7 +70,7 @@ class Peer:
         self.stream.close()
 
 
-class UnixTestListener:
+class UnixGoListener:
     def __init__(self, address: str) -> None:
         self.address = address
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -126,7 +128,7 @@ if os.name == "nt":
     kernel32.ConnectNamedPipe.restype = wintypes.BOOL
 
 
-    class WindowsTestListener:
+    class WindowsGoListener:
         def __init__(self, address: str) -> None:
             self.handle = kernel32.CreateNamedPipeW(
                 address,
@@ -180,15 +182,15 @@ if os.name == "nt":
                 self.handle = INVALID_HANDLE_VALUE
 
 
-def listen(config) -> UnixTestListener:
+def open_go_listener(config) -> UnixGoListener | WindowsGoListener:
     address = resolve_transport_address(config.endpoint_name, config.token)
     if os.name == "nt":
-        return WindowsTestListener(address)
-    return UnixTestListener(address)
+        return WindowsGoListener(address)
+    return UnixGoListener(address)
 
 
 def establish(engine, config, packet: bytes | None = None):
-    listener = listen(config)
+    listener = open_go_listener(config)
     result = {}
 
     def run_connect() -> None:
@@ -205,7 +207,7 @@ def establish(engine, config, packet: bytes | None = None):
     peer.write(packet if packet is not None else handshake())
     ack = peer.read(4)
     assignment = peer.read_frame()
-    worker.join(2.0)
+    worker.join(TEST_TIMEOUT)
     listener.close()
     if worker.is_alive():
         raise AssertionError("engine connect did not finish")
@@ -214,14 +216,14 @@ def establish(engine, config, packet: bytes | None = None):
     return peer, ack, assignment, result["view"]
 
 
-def wait_for(probe, timeout: float = 2.0):
+def wait_for(probe, diagnostic: str = "condition", timeout: float = TEST_TIMEOUT):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         value = probe()
         if value:
             return value
-        time.sleep(0.005)
-    raise AssertionError("condition timed out")
+        time.sleep(POLL_INTERVAL)
+    raise AssertionError(f"timed out waiting for {diagnostic}")
 
 
 def decode_json(frame_value: tuple[int, int, bytes]):
