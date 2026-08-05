@@ -109,6 +109,19 @@ JSON/MessagePack decoding, correlation, and platform-native transport. The
 tests use the frozen vectors and a private Go-role listener in `tests/testkit.py`.
 The listener is not part of the installed package or public API.
 
+Run the real Go listener against the private Python engine fixture explicitly:
+
+    python integration/run.py
+
+On WSL, one command creates an ignored virtual environment, installs MsgPack
+and the SDK without sudo, then runs the same real integration cell:
+
+    bash scripts/verify-wsl.sh
+
+The adapter fails when the sibling Go checkout or a runtime is unavailable; it
+never skips. Setuptools packages only yuumi, so neither adapter nor fixture is
+part of the installed package.
+
 The authoritative contracts are
 [`ENGINE_API.md`](../yuumi-spec/ENGINE_API.md) and
 [`PROTOCOL.md`](../yuumi-spec/PROTOCOL.md).
