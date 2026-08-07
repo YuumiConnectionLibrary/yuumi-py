@@ -10,6 +10,7 @@ import tomllib
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import msgpack
 import yuumi
@@ -26,7 +27,7 @@ from testkit import (
     vector,
     wait_for,
 )
-from yuumi.transport import TransportClosed, resolve_transport_address
+from yuumi.transport import TransportClosed, TransportFailure, resolve_transport_address
 
 
 class EngineConformance(unittest.TestCase):
@@ -191,9 +192,17 @@ class EngineConformance(unittest.TestCase):
         )
         worker.start()
         peer = Peer(listener.accept())
-        peer.write(handshake())
+        wait_for(lambda: engine._candidate, "EC-008 handshake candidate")
+        candidate = engine._candidate
+        self.assertIsNotNone(candidate)
+        with patch.object(
+            candidate,
+            "write_all",
+            side_effect=TransportFailure("injected establishment write failure"),
+        ):
+            peer.write(handshake())
+            worker.join(TEST_TIMEOUT)
         peer.close()
-        worker.join(TEST_TIMEOUT)
         listener.close()
         self.assertFalse(worker.is_alive())
         self.assertIn("error", caught)
@@ -489,7 +498,7 @@ class EngineConformance(unittest.TestCase):
         engine, peer, _, _, view = self.connected(
             self.engine(
                 heartbeat=yuumi.HeartbeatSettings(
-                    interval=0.02, missed_interval_limit=3
+                    interval=0.1, missed_interval_limit=3
                 )
             )
         )
@@ -520,7 +529,7 @@ class EngineConformance(unittest.TestCase):
         peer = Peer(listener.accept())
         wait_for(lambda: engine._candidate, "EC-025 incomplete handshake candidate")
         engine.close()
-        worker.join(TEST_TIMEOUT)
+        worker.join(TEST_TIMEOUT * 2)
         peer.close()
         listener.close()
         self.assertFalse(worker.is_alive())

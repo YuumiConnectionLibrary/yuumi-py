@@ -7,7 +7,7 @@ name = "yuumi-py"
 version = "0.1.0"
 description = "Python Engine SDK for Yuumi IPC protocol version 1"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 dependencies = [
   "msgpack>=1.0.7",
 ]

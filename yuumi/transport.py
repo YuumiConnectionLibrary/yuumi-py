@@ -8,10 +8,12 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 from typing import Protocol
 
 _ENDPOINT_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}\Z")
 _TOKEN_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
+_SOCKET_POLL_INTERVAL = 0.1
 
 
 class TransportClosed(Exception):
@@ -70,9 +72,14 @@ class SocketStream:
     def __init__(self, value: socket.socket) -> None:
         self._socket: socket.socket | None = value
         self._close_lock = threading.Lock()
+        self._timeout = value.gettimeout()
+        value.settimeout(_SOCKET_POLL_INTERVAL)
 
     def read_exact(self, size: int) -> bytes:
         output = bytearray()
+        with self._close_lock:
+            timeout = self._timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
         while len(output) < size:
             with self._close_lock:
                 value = self._socket
@@ -83,7 +90,12 @@ class SocketStream:
             try:
                 part = value.recv(size - len(output))
             except socket.timeout as exc:
-                raise TransportTimeout("transport read timed out") from exc
+                with self._close_lock:
+                    if self._socket is None:
+                        raise TransportClosed("connection closed") from exc
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TransportTimeout("transport read timed out") from exc
+                continue
             except OSError as exc:
                 with self._close_lock:
                     if self._socket is None:
@@ -97,19 +109,32 @@ class SocketStream:
         return bytes(output)
 
     def write_all(self, data: bytes) -> None:
+        offset = 0
         with self._close_lock:
-            value = self._socket
-        if value is None:
-            raise TransportClosed("connection closed")
-        try:
-            value.sendall(data)
-        except socket.timeout as exc:
-            raise TransportTimeout("transport write timed out") from exc
-        except OSError as exc:
+            timeout = self._timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while offset < len(data):
             with self._close_lock:
-                if self._socket is None:
-                    raise TransportClosed("connection closed") from exc
-            raise TransportFailure(str(exc)) from exc
+                value = self._socket
+            if value is None:
+                raise TransportClosed("connection closed")
+            try:
+                transferred = value.send(data[offset:])
+            except socket.timeout as exc:
+                with self._close_lock:
+                    if self._socket is None:
+                        raise TransportClosed("connection closed") from exc
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TransportTimeout("transport write timed out") from exc
+                continue
+            except OSError as exc:
+                with self._close_lock:
+                    if self._socket is None:
+                        raise TransportClosed("connection closed") from exc
+                raise TransportFailure(str(exc)) from exc
+            if transferred == 0:
+                raise TransportFailure("transport write made no progress")
+            offset += transferred
 
     def close(self) -> None:
         with self._close_lock:
@@ -141,9 +166,8 @@ class SocketStream:
         return None
 
     def set_timeout(self, timeout: float | None) -> None:
-        value = self._socket
-        if value is not None:
-            value.settimeout(timeout)
+        with self._close_lock:
+            self._timeout = timeout
 
 
 def dial_local(address: str, timeout: float) -> Stream:

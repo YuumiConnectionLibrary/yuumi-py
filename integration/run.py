@@ -19,6 +19,7 @@ subprocess.run(
     [
         "go",
         "test",
+        "-v",
         "-tags=interop",
         "-run",
         "^TestGoEngineInterop$",

@@ -7,7 +7,7 @@ does not expose a client, listener, Runner, or automatic reconnect API.
 
 ## Requirements
 
-- Python 3.11 or newer
+- Python 3.14 or newer
 - Linux, macOS, or Windows
 - `msgpack` for MessagePack application payloads
 
@@ -125,3 +125,6 @@ part of the installed package.
 The authoritative contracts are
 [`ENGINE_API.md`](../yuumi-spec/ENGINE_API.md) and
 [`PROTOCOL.md`](../yuumi-spec/PROTOCOL.md).
+
+The required CI matrix, immutable spec pin, artifacts, timeout, cleanup, and
+local equivalents are documented in [`CI.md`](CI.md).

@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  YUUMI_SPEC_SHA: 45729f1075ec5afcd9fd811db944385d6672eec3
+  PYTHON_VERSION: 3.x
+  GO_VERSION: stable
+
+jobs:
+  verify-spec:
+    name: Pinned spec
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out pinned specification
+        uses: actions/checkout@v6
+        with:
+          repository: YuumiConnectionLibrary/yuumi-spec
+          ref: ${{ env.YUUMI_SPEC_SHA }}
+          path: yuumi-spec
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up latest stable Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Validate exact spec revision and contract data
+        run: >-
+          python yuumi-spec/conformance/spec_ci.py
+          --spec-sha ${{ env.YUUMI_SPEC_SHA }}
+          --output-dir artifacts/spec
+      - name: Upload spec evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: yuumi-py-spec-${{ env.YUUMI_SPEC_SHA }}
+          path: artifacts/spec
+          if-no-files-found: error
+          retention-days: 14
+
+  test:
+    name: Python ${{ matrix.os }}
+    needs: verify-spec
+    if: always()
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - name: Check out Python SDK
+        uses: actions/checkout@v6
+        with:
+          path: yuumi-py
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out pinned specification
+        uses: actions/checkout@v6
+        with:
+          repository: YuumiConnectionLibrary/yuumi-spec
+          ref: ${{ env.YUUMI_SPEC_SHA }}
+          path: yuumi-spec
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out Go client
+        uses: actions/checkout@v6
+        with:
+          repository: YuumiConnectionLibrary/Yuumi
+          ref: dev
+          path: Yuumi
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up latest stable Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Set up latest stable Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Install SDK
+        run: python -m pip install --disable-pip-version-check ./yuumi-py
+      - name: Check installed dependencies
+        run: python -m pip check
+      - name: Validate wheel contents
+        run: python -m pip wheel --no-deps --wheel-dir artifacts/package ./yuumi-py
+      - name: Run conformance and real Go interop
+        if: always()
+        run: >-
+          python yuumi-spec/conformance/harness.py
+          --repositories-root .
+          --spec-sha ${{ env.YUUMI_SPEC_SHA }}
+          --platform ${{ runner.os == 'Windows' && 'windows' || runner.os == 'macOS' && 'macos' || 'linux' }}
+          --sdk python
+          --stage all
+          --output-dir artifacts/harness
+          --timeout 240
+      - name: Record toolchain and cleanup diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          "spec_sha=$env:YUUMI_SPEC_SHA" | Out-File artifacts/toolchains.txt -Encoding utf8
+          python --version 2>&1 | Out-File artifacts/toolchains.txt -Encoding utf8 -Append
+          go version 2>&1 | Out-File artifacts/toolchains.txt -Encoding utf8 -Append
+          git -C yuumi-py rev-parse HEAD | Out-File artifacts/toolchains.txt -Encoding utf8 -Append
+          git -C yuumi-spec rev-parse HEAD | Out-File artifacts/toolchains.txt -Encoding utf8 -Append
+          git -C Yuumi rev-parse HEAD | Out-File artifacts/toolchains.txt -Encoding utf8 -Append
+      - name: Upload cell evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: yuumi-py-${{ matrix.os }}-${{ env.YUUMI_SPEC_SHA }}
+          path: artifacts
+          if-no-files-found: error
+          retention-days: 14
